@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "wolfguard",
+  "project_id": "9f17adae-2663-4f93-a3e8-4a774052e480"
+}

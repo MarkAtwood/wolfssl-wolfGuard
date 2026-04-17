@@ -26,3 +26,8 @@ user-src/wg-fips
 *.exe
 *.pro.user
 *~
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
