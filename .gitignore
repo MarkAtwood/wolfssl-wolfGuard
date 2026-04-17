@@ -31,3 +31,9 @@ user-src/wg-fips
 .dolt/
 *.db
 .beads-credential-key
+
+# AI / beads tooling - tracked on personal branch, not in upstream PRs
+.beads/
+.claude/
+CLAUDE.md
+AGENTS.md
