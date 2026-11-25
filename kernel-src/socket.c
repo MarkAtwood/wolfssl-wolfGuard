@@ -363,10 +363,10 @@ static void sock_free(struct sock *sock)
 	if (unlikely(!sock))
 		return;
 	sk_clear_memalloc(sock);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 2, 0)
-	udp_tunnel_sock_release(sock->sk_socket);
-#else
+#ifdef COMPAT_UDP_TUNNEL_SOCK_RELEASE_TAKES_SOCK
 	udp_tunnel_sock_release(sock);
+#else
+	udp_tunnel_sock_release(sock->sk_socket);
 #endif
 }
 
@@ -421,10 +421,10 @@ retry:
 		goto out;
 	}
 	set_sock_opts(new4);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 2, 0)
-	setup_udp_tunnel_sock(net, new4, &cfg);
-#else
+#ifdef COMPAT_SETUP_UDP_TUNNEL_SOCK_TAKES_SOCK
 	setup_udp_tunnel_sock(net, new4->sk, &cfg);
+#else
+	setup_udp_tunnel_sock(net, new4, &cfg);
 #endif
 
 #if IS_ENABLED(CONFIG_IPV6)
@@ -432,10 +432,10 @@ retry:
 		port6.local_udp_port = inet_sk(new4->sk)->inet_sport;
 		ret = udp_sock_create(net, &port6, &new6);
 		if (ret < 0) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 2, 0)
-			udp_tunnel_sock_release(new4);
-#else
+#ifdef COMPAT_UDP_TUNNEL_SOCK_RELEASE_TAKES_SOCK
 			udp_tunnel_sock_release(new4->sk);
+#else
+			udp_tunnel_sock_release(new4);
 #endif
 			if (ret == -EADDRINUSE && !port && retries++ < 100)
 				goto retry;
@@ -444,10 +444,10 @@ retry:
 			goto out;
 		}
 		set_sock_opts(new6);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 2, 0)
-		setup_udp_tunnel_sock(net, new6, &cfg);
-#else
+#ifdef COMPAT_SETUP_UDP_TUNNEL_SOCK_TAKES_SOCK
 		setup_udp_tunnel_sock(net, new6->sk, &cfg);
+#else
+		setup_udp_tunnel_sock(net, new6, &cfg);
 #endif
 	}
 #endif
