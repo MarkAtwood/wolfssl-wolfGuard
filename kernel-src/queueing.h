@@ -63,6 +63,25 @@ struct packet_cb {
 	atomic_t state;
 	u32 mtu;
 	u8 ds;
+	/* What the pre-authentication length gate resolved about this packet.
+	 *
+	 * wg_packet_receive() resolves it in softirq and queues the skb; the
+	 * handshake worker then dequeues one and is handed nothing but the
+	 * device, so this control block is the only channel between the two.
+	 * Carrying the decision keeps it single sourced, so the worker consumes
+	 * what the gate decided instead of deciding again from the header.
+	 *
+	 * Today the only thing resolved is the message type, and a second
+	 * derivation would reach the same answer. That stops being true once a
+	 * message's length selects a cipher suite: a packet could then be MAC'd
+	 * under the suite the gate chose and parsed under the suite the worker
+	 * chose. The suite joins this field at that point. The channel is here
+	 * so that it can.
+	 *
+	 * It costs nothing: packet_cb was 32 bytes with 7 bytes of trailing
+	 * padding, inside a 48 byte skb->cb.
+	 */
+	u8 message_type;
 };
 
 #define PACKET_CB(skb) ((struct packet_cb *)((skb)->cb))

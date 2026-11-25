@@ -99,6 +99,8 @@ static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
 	header_len = validate_header_len(skb);
 	if (unlikely(!header_len))
 		return -EINVAL;
+	/* Resolved once, here, and carried to whoever consumes the packet. */
+	PACKET_CB(skb)->message_type = le32_to_cpu(SKB_TYPE_LE32(skb));
 	__skb_push(skb, data_offset);
 	if (unlikely(!pskb_may_pull(skb, data_offset + header_len)))
 		return -EINVAL;
@@ -119,7 +121,7 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 	bool under_load;
 	int ret;
 
-	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE)) {
+	if (PACKET_CB(skb)->message_type == MESSAGE_HANDSHAKE_COOKIE) {
 		net_dbg_skb_ratelimited("%s: Receiving cookie response from %pISpfsc\n",
 					wg->dev->name, skb);
 		return wg_cookie_message_consume(
@@ -148,8 +150,8 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 		return -EBADMSG;
 	}
 
-	switch (SKB_TYPE_LE32(skb)) {
-	case cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION): {
+	switch (PACKET_CB(skb)->message_type) {
+	case MESSAGE_HANDSHAKE_INITIATION: {
 		struct message_handshake_initiation *message =
 			(struct message_handshake_initiation *)skb->data;
 
@@ -177,7 +179,7 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 		ret = 0;
 		break;
 	}
-	case cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE): {
+	case MESSAGE_HANDSHAKE_RESPONSE: {
 		struct message_handshake_response *message =
 			(struct message_handshake_response *)skb->data;
 
@@ -576,10 +578,10 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 {
 	if (unlikely(prepare_skb_header(skb, wg) < 0))
 		goto err;
-	switch (SKB_TYPE_LE32(skb)) {
-	case cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION):
-	case cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE):
-	case cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE): {
+	switch (PACKET_CB(skb)->message_type) {
+	case MESSAGE_HANDSHAKE_INITIATION:
+	case MESSAGE_HANDSHAKE_RESPONSE:
+	case MESSAGE_HANDSHAKE_COOKIE: {
 		int cpu;
 
 		if (skb_queue_len(&wg->incoming_handshakes) >
@@ -598,7 +600,7 @@ void wg_packet_receive(struct wg_device *wg, struct sk_buff *skb)
 			&per_cpu_ptr(wg->incoming_handshakes_worker, cpu)->work);
 		break;
 	}
-	case cpu_to_le32(MESSAGE_DATA):
+	case MESSAGE_DATA:
 		PACKET_CB(skb)->ds = ip_tunnel_get_dsfield(ip_hdr(skb), skb);
 		wg_packet_consume_data(wg, skb);
 		break;
