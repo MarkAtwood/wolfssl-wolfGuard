@@ -10,6 +10,7 @@
 #include "peer.h"
 #include "timers.h"
 #include "messages.h"
+#include "wire.h"
 #include "cookie.h"
 #include "socket.h"
 
@@ -40,22 +41,29 @@ static void update_rx_stats(struct wg_peer *peer, size_t len)
 
 #define SKB_TYPE_LE32(skb) (((struct message_header *)(skb)->data)->type)
 
+/* The handshake lengths come from the layout rather than a struct size. With
+ * one suite this still accepts exactly one length per type; 6ytx.24 turns these
+ * equality tests into a search over the accepted suites, which is the whole
+ * point of computing them here instead of baking them in.
+ */
 static size_t validate_header_len(struct sk_buff *skb)
 {
+	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
+
 	if (unlikely(skb->len < sizeof(struct message_header)))
 		return 0;
 	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_DATA) &&
 	    skb->len >= MESSAGE_MINIMUM_LENGTH)
 		return sizeof(struct message_data);
 	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION) &&
-	    skb->len == sizeof(struct message_handshake_initiation))
-		return sizeof(struct message_handshake_initiation);
+	    skb->len == wg_wire_initiation_size(l))
+		return wg_wire_initiation_size(l);
 	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE) &&
-	    skb->len == sizeof(struct message_handshake_response))
-		return sizeof(struct message_handshake_response);
+	    skb->len == wg_wire_response_size(l))
+		return wg_wire_response_size(l);
 	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE) &&
-	    skb->len == sizeof(struct message_handshake_cookie))
-		return sizeof(struct message_handshake_cookie);
+	    skb->len == wg_wire_cookie_size(l))
+		return wg_wire_cookie_size(l);
 	return 0;
 }
 
@@ -122,10 +130,14 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 	int ret;
 
 	if (PACKET_CB(skb)->message_type == MESSAGE_HANDSHAKE_COOKIE) {
+		struct wg_cookie_view cookie;
+
 		net_dbg_skb_ratelimited("%s: Receiving cookie response from %pISpfsc\n",
 					wg->dev->name, skb);
-		return wg_cookie_message_consume(
-			(struct message_handshake_cookie *)skb->data, wg);
+		if (unlikely(!wg_wire_view_cookie(&cookie, &wg_wire_compiled_layout,
+						  skb->data, skb->len)))
+			return -EBADMSG;
+		return wg_cookie_message_consume(&cookie, wg);
 	}
 
 	under_load = skb_queue_len(&wg->incoming_handshakes) >=
@@ -152,14 +164,18 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 
 	switch (PACKET_CB(skb)->message_type) {
 	case MESSAGE_HANDSHAKE_INITIATION: {
-		struct message_handshake_initiation *message =
-			(struct message_handshake_initiation *)skb->data;
+		struct wg_initiation_view message;
+
+		if (unlikely(!wg_wire_view_initiation(&message,
+						      &wg_wire_compiled_layout,
+						      skb->data, skb->len)))
+			return -EBADMSG;
 
 		if (packet_needs_cookie) {
 			return wg_packet_send_handshake_cookie(wg, skb,
-							message->sender_index);
+					wg_wire_get_index(message.sender_index));
 		}
-		peer = wg_noise_handshake_consume_initiation(message, wg);
+		peer = wg_noise_handshake_consume_initiation(&message, wg);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake initiation from %pISpfsc\n",
 						wg->dev->name, skb);
@@ -180,14 +196,18 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 		break;
 	}
 	case MESSAGE_HANDSHAKE_RESPONSE: {
-		struct message_handshake_response *message =
-			(struct message_handshake_response *)skb->data;
+		struct wg_response_view message;
+
+		if (unlikely(!wg_wire_view_response(&message,
+						    &wg_wire_compiled_layout,
+						    skb->data, skb->len)))
+			return -EBADMSG;
 
 		if (packet_needs_cookie) {
 			return wg_packet_send_handshake_cookie(wg, skb,
-							message->sender_index);
+					wg_wire_get_index(message.sender_index));
 		}
-		peer = wg_noise_handshake_consume_response(message, wg);
+		peer = wg_noise_handshake_consume_response(&message, wg);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake response from %pISpfsc\n",
 						wg->dev->name, skb);

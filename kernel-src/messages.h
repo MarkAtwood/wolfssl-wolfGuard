@@ -76,35 +76,14 @@ struct __attribute__((packed)) message_header {
 	__le32 type;
 };
 
-struct __attribute__((packed)) message_macs {
-	u8 mac1[COOKIE_LEN];
-	u8 mac2[COOKIE_LEN];
-};
-
-struct __attribute__((packed)) message_handshake_initiation {
-	struct message_header header;
-	__le32 sender_index;
-	u8 unencrypted_ephemeral[NOISE_PUBLIC_KEY_LEN];
-	u8 encrypted_static[noise_encrypted_len(NOISE_PUBLIC_KEY_LEN)];
-	u8 encrypted_timestamp[noise_encrypted_len(NOISE_TIMESTAMP_LEN)];
-	struct message_macs macs;
-};
-
-struct __attribute__((packed)) message_handshake_response {
-	struct message_header header;
-	__le32 sender_index;
-	__le32 receiver_index;
-	u8 unencrypted_ephemeral[NOISE_PUBLIC_KEY_LEN];
-	u8 encrypted_nothing[noise_encrypted_len(0)];
-	struct message_macs macs;
-};
-
-struct __attribute__((packed)) message_handshake_cookie {
-	struct message_header header;
-	__le32 receiver_index;
-	u8 nonce[COOKIE_NONCE_LEN];
-	u8 encrypted_cookie[noise_encrypted_len(COOKIE_LEN)];
-};
+/* The three handshake messages have no struct. Their field offsets depend on
+ * the suite in force, through the public key encoding and the hash, so they
+ * live in wire.h as a layout plus a view of pointers into the buffer. A packed
+ * struct here would be correct for exactly one suite and silently wrong for
+ * the next, which is the whole of WOLFGUARD-AGILITY-6ytx.23.
+ *
+ * message_data keeps its struct: neither axis moves it.
+ */
 
 struct __attribute__((packed)) message_data {
 	struct message_header header;

@@ -9,6 +9,7 @@
 #include "device.h"
 #include "noise.h"
 #include "queueing.h"
+#include "wire.h"
 #include "ratelimiter.h"
 #include "netlink.h"
 #include "uapi/wolfguard.h"
@@ -28,7 +29,7 @@ static int __init mod_init(void)
 
 #ifdef DEBUG
 	if (!wg_allowedips_selftest() || !wg_packet_counter_selftest() ||
-	    !wg_ratelimiter_selftest())
+	    !wg_ratelimiter_selftest() || !wg_wire_selftest())
 	{
 		ret = -ENOTRECOVERABLE;
 		goto err_device;

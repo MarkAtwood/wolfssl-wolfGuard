@@ -21,7 +21,7 @@ endif
 ccflags-y += -gdwarf-4
 ccflags-$(if $(WOLFGUARD_VERSION),y,) += -D'WOLFGUARD_VERSION="$(WOLFGUARD_VERSION)"'
 
-wolfguard-y := main.o noise.o device.o peer.o timers.o queueing.o send.o receive.o socket.o peerlookup.o allowedips.o ratelimiter.o cookie.o netlink.o
+wolfguard-y := main.o noise.o device.o peer.o timers.o queueing.o send.o receive.o socket.o peerlookup.o allowedips.o ratelimiter.o cookie.o netlink.o wire.o
 
 include $(src)/compat/Kbuild.include
 

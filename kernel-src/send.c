@@ -11,6 +11,7 @@
 #include "peer.h"
 #include "socket.h"
 #include "messages.h"
+#include "wire.h"
 #include "cookie.h"
 
 #include <linux/uio.h>
@@ -22,7 +23,14 @@
 
 static int __must_check wg_packet_send_handshake_initiation(struct wg_peer *peer)
 {
-	struct message_handshake_initiation packet;
+	/* Sized by the largest suite, used to the length of the one in force.
+	 * WG_WIRE_MAX_HANDSHAKE_LEN is a compile-time bound so the frame stays
+	 * within Kbuild's -Wframe-larger-than, and the create call refuses a
+	 * length that is not exactly right for the layout.
+	 */
+	u8 packet[WG_WIRE_MAX_HANDSHAKE_LEN];
+	const size_t packet_len =
+		wg_wire_initiation_size(&wg_wire_compiled_layout);
 	int ret;
 	u64 cur_last_sent_handshake = atomic64_read(&peer->last_sent_handshake);
 	u64 speculative_last_sent_handshake;
@@ -37,10 +45,11 @@ static int __must_check wg_packet_send_handshake_initiation(struct wg_peer *peer
 			    peer->device->dev->name, peer->internal_id,
 			    &peer->endpoint.addr);
 
-	if (wg_noise_handshake_create_initiation(&packet, &peer->handshake)) {
-		ret = wg_cookie_add_mac_to_packet(&packet, sizeof(packet), peer);
+	if (wg_noise_handshake_create_initiation(packet, packet_len,
+						 &peer->handshake)) {
+		ret = wg_cookie_add_mac_to_packet(packet, packet_len, peer);
 		if (ret == 0) {
-			ret = wg_socket_send_buffer_to_peer(peer, &packet, sizeof(packet),
+			ret = wg_socket_send_buffer_to_peer(peer, packet, packet_len,
 							    HANDSHAKE_DSCP);
 			if (ret == 0) {
 				atomic64_set(&peer->last_sent_handshake,
@@ -125,7 +134,9 @@ out:
 
 int __must_check wg_packet_send_handshake_response(struct wg_peer *peer)
 {
-	struct message_handshake_response packet;
+	u8 packet[WG_WIRE_MAX_HANDSHAKE_LEN];
+	const size_t packet_len =
+		wg_wire_response_size(&wg_wire_compiled_layout);
 	int ret;
 
 	atomic64_set(&peer->last_sent_handshake, ktime_get_coarse_boottime_ns());
@@ -133,8 +144,9 @@ int __must_check wg_packet_send_handshake_response(struct wg_peer *peer)
 			    peer->device->dev->name, peer->internal_id,
 			    &peer->endpoint.addr);
 
-	if (wg_noise_handshake_create_response(&packet, &peer->handshake)) {
-		ret = wg_cookie_add_mac_to_packet(&packet, sizeof(packet), peer);
+	if (wg_noise_handshake_create_response(packet, packet_len,
+					       &peer->handshake)) {
+		ret = wg_cookie_add_mac_to_packet(packet, packet_len, peer);
 		if (ret == 0) {
 			if (! wg_noise_handshake_begin_session(&peer->handshake,
 							       &peer->keypairs))
@@ -149,8 +161,8 @@ int __must_check wg_packet_send_handshake_response(struct wg_peer *peer)
 			wg_timers_any_authenticated_packet_sent(peer);
 			atomic64_set(&peer->last_sent_handshake,
 				     ktime_get_coarse_boottime_ns());
-			ret = wg_socket_send_buffer_to_peer(peer, &packet,
-						      sizeof(packet),
+			ret = wg_socket_send_buffer_to_peer(peer, packet,
+						      packet_len,
 						      HANDSHAKE_DSCP);
 		}
 	}
@@ -159,7 +171,7 @@ int __must_check wg_packet_send_handshake_response(struct wg_peer *peer)
 		ret = -ECANCELED;
 	}
 
-	memzero_explicit(&packet, sizeof packet);
+	memzero_explicit(packet, sizeof packet);
 
 	return ret;
 }
@@ -168,19 +180,21 @@ int wg_packet_send_handshake_cookie(struct wg_device *wg,
 				     struct sk_buff *initiating_skb,
 				     __le32 sender_index)
 {
-	struct message_handshake_cookie packet;
+	u8 packet[WG_WIRE_MAX_HANDSHAKE_LEN];
+	const size_t packet_len =
+		wg_wire_cookie_size(&wg_wire_compiled_layout);
 	int ret;
 
 	net_dbg_skb_ratelimited("%s: Sending cookie response for denied handshake message for %pISpfsc\n",
 				wg->dev->name, initiating_skb);
 
-	ret = wg_cookie_message_create(&packet, initiating_skb, sender_index,
-				 &wg->cookie_checker);
+	ret = wg_cookie_message_create(packet, packet_len, initiating_skb,
+				 sender_index, &wg->cookie_checker);
 	if (ret != 0)
 		return ret;
 
-	return wg_socket_send_buffer_as_reply_to_skb(wg, initiating_skb, &packet,
-					      sizeof(packet));
+	return wg_socket_send_buffer_as_reply_to_skb(wg, initiating_skb, packet,
+					      packet_len);
 }
 
 static void keep_key_fresh(struct wg_peer *peer)

@@ -6,6 +6,7 @@
  */
 
 #include "noise.h"
+#include "wire.h"
 #include "device.h"
 #include "peer.h"
 #include "messages.h"
@@ -597,12 +598,20 @@ static void tai64n_now(u8 output[NOISE_TIMESTAMP_LEN])
 }
 
 bool
-wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
+wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 				     struct noise_handshake *handshake)
 {
+	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
+	struct wg_initiation_view v;
 	u8 timestamp[NOISE_TIMESTAMP_LEN];
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
 	bool ret = false;
+
+	/* Checked before any lock is taken: a buffer of the wrong size is the
+	 * caller's bug, not a handshake failure.
+	 */
+	if (unlikely(!wg_wire_view_initiation(&v, l, dst, dst_len)))
+		return false;
 
 	down_read(&handshake->static_identity->lock);
 	down_write(&handshake->lock);
@@ -610,7 +619,7 @@ wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
 	if (unlikely(!handshake->static_identity->has_identity))
 		goto out;
 
-	dst->header.type = cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION);
+	wg_wire_put_header(dst, MESSAGE_HANDSHAKE_INITIATION);
 
 	if (handshake_init(handshake->chaining_key, handshake->hash,
 			   handshake->remote_static) != 0)
@@ -618,12 +627,12 @@ wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
 
 	/* e */
 	if (wc_ecc_make_keypair_exim(handshake->ephemeral_private, sizeof(handshake->ephemeral_private),
-				     dst->unencrypted_ephemeral, sizeof(dst->unencrypted_ephemeral),
+				     v.unencrypted_ephemeral, l->public_key_len,
 				     NOISE_CURVE_ID, WG_PUBLIC_KEY_COMPRESSED) != 0)
 		goto out;
 
-	if (message_ephemeral(dst->unencrypted_ephemeral,
-			      dst->unencrypted_ephemeral, handshake->chaining_key,
+	if (message_ephemeral(v.unencrypted_ephemeral,
+			      v.unencrypted_ephemeral, handshake->chaining_key,
 			      handshake->hash) != 0)
 		goto out;
 
@@ -633,7 +642,8 @@ wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
 		goto out;
 
 	/* s */
-	if (message_encrypt(dst->encrypted_static, sizeof(dst->encrypted_static),
+	if (message_encrypt(v.encrypted_static,
+			    wg_wire_encrypted(l, l->public_key_len),
 			    handshake->static_identity->static_public,
 			    NOISE_PUBLIC_KEY_LEN, key, handshake->hash) != 0)
 		goto out;
@@ -645,13 +655,14 @@ wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
 
 	/* {t} */
 	tai64n_now(timestamp);
-	if (message_encrypt(dst->encrypted_timestamp, sizeof(dst->encrypted_timestamp), timestamp,
+	if (message_encrypt(v.encrypted_timestamp,
+			    wg_wire_encrypted(l, WG_WIRE_TIMESTAMP_LEN), timestamp,
 			    NOISE_TIMESTAMP_LEN, key, handshake->hash) != 0)
 		goto out;
 
-	dst->sender_index = wg_index_hashtable_insert(
+	wg_wire_set_index(v.sender_index, wg_index_hashtable_insert(
 		handshake->entry.peer->device->index_hashtable,
-		&handshake->entry);
+		&handshake->entry));
 
 	handshake->state = HANDSHAKE_CREATED_INITIATION;
 	ret = true;
@@ -665,9 +676,10 @@ out:
 }
 
 struct wg_peer *
-wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
+wg_noise_handshake_consume_initiation(const struct wg_initiation_view *src,
 				      struct wg_device *wg)
 {
+	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;
 	bool replay_attack, flood_attack;
@@ -698,7 +710,7 @@ wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
 
 	/* s */
 	if (!message_decrypt(s, sizeof(s), src->encrypted_static,
-			     sizeof(src->encrypted_static), key, hash)) {
+			     wg_wire_encrypted(l, l->public_key_len), key, hash)) {
 		WC_DEBUG_PR_CODEPOINT();
 		goto out;
 	}
@@ -720,7 +732,7 @@ wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
 
 	/* {t} */
 	if (!message_decrypt(t, sizeof(t), src->encrypted_timestamp,
-			     sizeof(src->encrypted_timestamp), key, hash)) {
+			     wg_wire_encrypted(l, WG_WIRE_TIMESTAMP_LEN), key, hash)) {
 		WC_DEBUG_PR_CODEPOINT();
 		goto out;
 	}
@@ -750,7 +762,7 @@ wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
 		memcpy(handshake->latest_timestamp, t, NOISE_TIMESTAMP_LEN);
 	memcpy(handshake->hash, hash, NOISE_HASH_LEN);
 	memcpy(handshake->chaining_key, chaining_key, NOISE_HASH_LEN);
-	handshake->remote_index = src->sender_index;
+	handshake->remote_index = wg_wire_get_index(src->sender_index);
 	initiation_consumption = ktime_get_coarse_boottime_ns();
 	if ((s64)(handshake->last_initiation_consumption - initiation_consumption) < 0)
 		handshake->last_initiation_consumption = initiation_consumption;
@@ -769,11 +781,16 @@ out:
 	WC_DEBUG_PR_NULL_RET(ret_peer);
 }
 
-bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
+bool wg_noise_handshake_create_response(u8 *dst, size_t dst_len,
 					struct noise_handshake *handshake)
 {
+	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
+	struct wg_response_view v;
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
 	bool ret = false;
+
+	if (unlikely(!wg_wire_view_response(&v, l, dst, dst_len)))
+		return false;
 
 	down_read(&handshake->static_identity->lock);
 	down_write(&handshake->lock);
@@ -781,17 +798,17 @@ bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
 	if (handshake->state != HANDSHAKE_CONSUMED_INITIATION)
 		goto out;
 
-	dst->header.type = cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE);
-	dst->receiver_index = handshake->remote_index;
+	wg_wire_put_header(dst, MESSAGE_HANDSHAKE_RESPONSE);
+	wg_wire_set_index(v.receiver_index, handshake->remote_index);
 
 	/* e */
 	if (wc_ecc_make_keypair_exim(handshake->ephemeral_private, sizeof(handshake->ephemeral_private),
-				     dst->unencrypted_ephemeral, sizeof(dst->unencrypted_ephemeral),
+				     v.unencrypted_ephemeral, l->public_key_len,
 				     NOISE_CURVE_ID, WG_PUBLIC_KEY_COMPRESSED) != 0)
 		goto out;
 
-	if (message_ephemeral(dst->unencrypted_ephemeral,
-			      dst->unencrypted_ephemeral, handshake->chaining_key,
+	if (message_ephemeral(v.unencrypted_ephemeral,
+			      v.unencrypted_ephemeral, handshake->chaining_key,
 			      handshake->hash) != 0)
 		goto out;
 
@@ -811,13 +828,13 @@ bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
 		goto out;
 
 	/* {} */
-	if (message_encrypt(dst->encrypted_nothing, sizeof(dst->encrypted_nothing),
+	if (message_encrypt(v.encrypted_nothing, wg_wire_encrypted(l, 0),
 			    NULL, 0, key, handshake->hash) != 0)
 		goto out;
 
-	dst->sender_index = wg_index_hashtable_insert(
+	wg_wire_set_index(v.sender_index, wg_index_hashtable_insert(
 		handshake->entry.peer->device->index_hashtable,
-		&handshake->entry);
+		&handshake->entry));
 
 	handshake->state = HANDSHAKE_CREATED_RESPONSE;
 	ret = true;
@@ -830,9 +847,10 @@ out:
 }
 
 struct wg_peer *
-wg_noise_handshake_consume_response(struct message_handshake_response *src,
+wg_noise_handshake_consume_response(const struct wg_response_view *src,
 				    struct wg_device *wg)
 {
+	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	enum noise_handshake_state state = HANDSHAKE_ZEROED;
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;
@@ -850,7 +868,7 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
 
 	handshake = (struct noise_handshake *)wg_index_hashtable_lookup(
 		wg->index_hashtable, INDEX_HASHTABLE_HANDSHAKE,
-		src->receiver_index, &peer);
+		wg_wire_get_index(src->receiver_index), &peer);
 	if (unlikely(!handshake))
 		goto out;
 
@@ -885,7 +903,7 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
 
 	/* {} */
 	if (!message_decrypt(NULL, 0, src->encrypted_nothing,
-			     sizeof(src->encrypted_nothing), key, hash))
+			     wg_wire_encrypted(l, 0), key, hash))
 		goto fail;
 
 	/* Success! Copy everything to peer */
@@ -900,7 +918,7 @@ wg_noise_handshake_consume_response(struct message_handshake_response *src,
 	memcpy(handshake->remote_ephemeral, e, NOISE_PUBLIC_KEY_LEN);
 	memcpy(handshake->hash, hash, NOISE_HASH_LEN);
 	memcpy(handshake->chaining_key, chaining_key, NOISE_HASH_LEN);
-	handshake->remote_index = src->sender_index;
+	handshake->remote_index = wg_wire_get_index(src->sender_index);
 	handshake->state = HANDSHAKE_CONSUMED_RESPONSE;
 	up_write(&handshake->lock);
 	ret_peer = peer;

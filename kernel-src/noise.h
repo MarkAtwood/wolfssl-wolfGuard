@@ -8,6 +8,7 @@
 #define _WG_NOISE_H
 
 #include "messages.h"
+#include "wire.h"
 #include "peerlookup.h"
 
 #include <linux/types.h>
@@ -119,17 +120,23 @@ void wg_noise_set_static_identity_private_key(
 	const u8 private_key[NOISE_PRIVATE_KEY_LEN]);
 void wg_noise_precompute_static_static(struct wg_peer *peer);
 
+/* The create functions take a buffer and its length rather than a struct,
+ * because the message size depends on the suite. They check the length against
+ * the layout and refuse a buffer that does not match exactly, so a caller
+ * cannot half-fill one. The consume functions take a view, which the caller
+ * has already pointed at the received packet.
+ */
 bool
-wg_noise_handshake_create_initiation(struct message_handshake_initiation *dst,
+wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 				     struct noise_handshake *handshake);
 struct wg_peer *
-wg_noise_handshake_consume_initiation(struct message_handshake_initiation *src,
+wg_noise_handshake_consume_initiation(const struct wg_initiation_view *src,
 				      struct wg_device *wg);
 
-bool wg_noise_handshake_create_response(struct message_handshake_response *dst,
+bool wg_noise_handshake_create_response(u8 *dst, size_t dst_len,
 					struct noise_handshake *handshake);
 struct wg_peer *
-wg_noise_handshake_consume_response(struct message_handshake_response *src,
+wg_noise_handshake_consume_response(const struct wg_response_view *src,
 				    struct wg_device *wg);
 
 bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
