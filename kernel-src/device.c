@@ -410,6 +410,14 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	 * it would advertise a suite that does not interoperate, which is worse
 	 * than not offering it. Adding this one line is all that turns it on
 	 * once that is fixed.
+	 *
+	 * What is actually in the way is 6ytx.52, not the transcript: wg-fips
+	 * has no suite keys at all, so the netlink surface 6ytx.28 built has no
+	 * client and a kernel device cannot be told which suite to initiate
+	 * with. Accepting SHA-384 here without that would be worse than
+	 * useless, because the device would still initiate legacy, the far end
+	 * accepts legacy too, and the resulting handshake would complete in
+	 * legacy while a matrix row reported the SHA-384 pair as passing.
 	 */
 
 	ret = wg_cookie_checker_init(&wg->cookie_checker, wg);
