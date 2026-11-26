@@ -8,6 +8,15 @@ ccflags-y := -O3
 ccflags-$(CONFIG_WOLFGUARD_DEBUG) += -DDEBUG -g
 ccflags-y += -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'
 ccflags-y += -Wframe-larger-than=2048
+# aarch64: gcc enables -moutline-atomics by default, which emits calls to
+# __aarch64_cas*_* and __aarch64_ldadd*_* helpers that live in libgcc. The
+# kernel exports none of them, so an out-of-tree module links clean and then
+# fails at modpost with, for example, __aarch64_cas4_acq_rel undefined. Nothing
+# in the Ubuntu 6.8 headers suppresses it for external modules, so the module
+# has to ask for itself.
+ifeq ($(CONFIG_ARM64),y)
+ccflags-y += -mno-outline-atomics
+endif
 # use dwarf 4 to avoid "Unsupported DW_TAG_atomic_type(0x47): type: 0x1ce18" on older kernels.
 ccflags-y += -gdwarf-4
 ccflags-$(if $(WOLFGUARD_VERSION),y,) += -D'WOLFGUARD_VERSION="$(WOLFGUARD_VERSION)"'
