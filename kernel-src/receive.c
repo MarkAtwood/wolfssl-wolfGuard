@@ -195,8 +195,7 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 			return wg_packet_send_handshake_cookie(wg, skb,
 					wg_wire_get_index(message.sender_index));
 		}
-		peer = wg_noise_handshake_consume_initiation(&message,
-							    suite->layout, wg);
+		peer = wg_noise_handshake_consume_initiation(&message, suite, wg);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake initiation from %pISpfsc\n",
 						wg->dev->name, skb);
@@ -227,8 +226,7 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 			return wg_packet_send_handshake_cookie(wg, skb,
 					wg_wire_get_index(message.sender_index));
 		}
-		peer = wg_noise_handshake_consume_response(&message,
-							  suite->layout, wg);
+		peer = wg_noise_handshake_consume_response(&message, suite, wg);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake response from %pISpfsc\n",
 						wg->dev->name, skb);

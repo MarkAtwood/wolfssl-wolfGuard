@@ -209,6 +209,13 @@ enum wg_suite_ids {
 
 extern const struct wg_suite wg_suite_legacy;
 
+/* Every suite this module knows how to speak, as opposed to the per-device
+ * accept set below, which is the subset a given device will answer for.
+ * wg_noise_init precomputes a transcript starting state for each of these.
+ */
+extern const struct wg_suite *const wg_known_suites[];
+extern const unsigned int wg_known_suites_n;
+
 /* Small enough that the index is a linear scan. There is no point in a hash
  * table for a handful of entries, and the scan runs once per handshake packet,
  * not per data packet.

@@ -40,6 +40,17 @@ static int __init mod_init(void)
 	if (ret < 0)
 		goto err_device;
 
+#ifdef DEBUG
+	/* After wg_noise_init, not with the others above: that call is what
+	 * fills the per-suite transcript table this checks, so running it
+	 * earlier would read an empty table and fail for the wrong reason.
+	 */
+	if (!wg_noise_selftest()) {
+		ret = -ENOTRECOVERABLE;
+		goto err_device;
+	}
+#endif
+
 	ret = wg_device_init();
 	if (ret < 0)
 		goto err_device;

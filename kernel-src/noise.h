@@ -118,6 +118,24 @@ void wg_noise_expire_current_peer_keypairs(struct wg_peer *peer);
 void wg_noise_set_static_identity_private_key(
 	struct noise_static_identity *static_identity,
 	const u8 private_key[NOISE_PRIVATE_KEY_LEN]);
+/* The starting state of a handshake transcript, precomputed per suite:
+ *   ChainKey = H(suite name)
+ *   Hash     = H(ChainKey || identifier)
+ * The suite's name is hashed into both, so a peer speaking a different suite
+ * cannot complete a handshake even before any length check. That is why this
+ * is per suite and not shared bookkeeping.
+ */
+struct noise_suite_transcript {
+	u8 chaining_key[NOISE_HASH_LEN];
+	u8 hash[NOISE_HASH_LEN];
+};
+
+const struct noise_suite_transcript *wg_noise_transcript_of(u8 suite_id);
+
+#ifdef DEBUG
+bool wg_noise_selftest(void);
+#endif
+
 void wg_noise_precompute_static_static(struct wg_peer *peer);
 
 /* The create functions take a buffer and its length rather than a struct,
@@ -131,14 +149,14 @@ wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 				     struct noise_handshake *handshake);
 struct wg_peer *
 wg_noise_handshake_consume_initiation(const struct wg_initiation_view *src,
-				      const struct wg_wire_layout *l,
+				      const struct wg_suite *suite,
 				      struct wg_device *wg);
 
 bool wg_noise_handshake_create_response(u8 *dst, size_t dst_len,
 					struct noise_handshake *handshake);
 struct wg_peer *
 wg_noise_handshake_consume_response(const struct wg_response_view *src,
-				    const struct wg_wire_layout *l,
+				    const struct wg_suite *suite,
 				    struct wg_device *wg);
 
 bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,

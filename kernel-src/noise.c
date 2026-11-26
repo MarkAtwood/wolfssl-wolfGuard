@@ -27,34 +27,76 @@
  * <- e, ee, se, psk, {}
  */
 
-static const u8 handshake_name[] = WG_HANDSHAKE_NAME;
 static const u8 identifier_name[] = "WolfGuard v1 info@wolfssl.com";
-static u8 handshake_init_hash[NOISE_HASH_LEN] __ro_after_init;
-static u8 handshake_init_chaining_key[NOISE_HASH_LEN] __ro_after_init;
+
+/* One starting transcript per suite this module knows, rather than one pair of
+ * globals derived from a compiled-in name. Written once at module init and
+ * read on every handshake, hence __ro_after_init.
+ *
+ * The identifier is still module wide. Per-device and per-peer identifiers are
+ * what the Go tree gained in 6ytx.21 and are not this change.
+ */
+static struct {
+	u8 id;
+	struct noise_suite_transcript t;
+} suite_transcripts[WG_MAX_SUITES] __ro_after_init;
+static unsigned int n_suite_transcripts __ro_after_init;
+
 static atomic64_t keypair_counter = ATOMIC64_INIT(0);
 
-__must_check int __init wg_noise_init(void)
+/* ChainKey = H(name), then Hash = H(ChainKey || identifier). wc_Sha256Final
+ * resets the context, which is why one context serves both digests.
+ */
+static int __init precompute_transcript(const char *name,
+					struct noise_suite_transcript *out)
 {
 	wc_Sha256 sha;
 	int ret;
 
 	ret = wc_InitSha256(&sha);
 	if (ret != 0) {
-		pr_err("ERROR: wg_noise_init() wc_InitSha256() failed with code %d.\n", ret);
+		pr_err("ERROR: precompute_transcript() wc_InitSha256() failed with code %d.\n", ret);
 		return -EINVAL;
 	}
 
-	ret = wc_Sha256Update(&sha, handshake_name, (word32)strlen(handshake_name));
+	ret = wc_Sha256Update(&sha, (const u8 *)name, (word32)strlen(name));
 	if (ret == 0)
-		ret = wc_Sha256Final(&sha, handshake_init_chaining_key);
+		ret = wc_Sha256Final(&sha, out->chaining_key);
 	if (ret == 0)
-		ret = wc_Sha256Update(&sha, handshake_init_chaining_key, NOISE_HASH_LEN);
+		ret = wc_Sha256Update(&sha, out->chaining_key, NOISE_HASH_LEN);
 	if (ret == 0)
 		ret = wc_Sha256Update(&sha, identifier_name, (word32)strlen(identifier_name));
 	if (ret == 0)
-		ret = wc_Sha256Final(&sha, handshake_init_hash);
+		ret = wc_Sha256Final(&sha, out->hash);
 
 	wc_Sha256Free(&sha);
+	return ret;
+}
+
+const struct noise_suite_transcript *wg_noise_transcript_of(u8 suite_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < n_suite_transcripts; ++i)
+		if (suite_transcripts[i].id == suite_id)
+			return &suite_transcripts[i].t;
+	return NULL;
+}
+
+__must_check int __init wg_noise_init(void)
+{
+	unsigned int i;
+	int ret = 0;
+
+	for (i = 0; i < wg_known_suites_n && i < WG_MAX_SUITES; ++i) {
+		const struct wg_suite *suite = wg_known_suites[i];
+
+		ret = precompute_transcript(suite->name, &suite_transcripts[i].t);
+		if (ret != 0)
+			break;
+		suite_transcripts[i].id = suite->id;
+		n_suite_transcripts = i + 1;
+	}
 
 	if (ret != 0) {
 		pr_err("ERROR: wg_noise_init() failed with code %d.\n", ret);
@@ -521,13 +563,25 @@ static int __must_check mix_psk(u8 chaining_key[NOISE_HASH_LEN], u8 hash[NOISE_H
 	WC_DEBUG_PR_NEG_RET(ret);
 }
 
-static int __must_check handshake_init(u8 chaining_key[NOISE_HASH_LEN],
+/* Begin a transcript under a given suite. The starting state comes from that
+ * suite's precomputed pair, so a handshake begun under one suite cannot be
+ * continued under another even if the lengths happened to agree.
+ */
+static int __must_check handshake_init(const struct wg_suite *suite,
+			   u8 chaining_key[NOISE_HASH_LEN],
 			   u8 hash[NOISE_HASH_LEN],
-			   const u8 remote_static[NOISE_PUBLIC_KEY_LEN])
+			   const u8 *remote_static)
 {
-	memcpy(hash, handshake_init_hash, NOISE_HASH_LEN);
-	memcpy(chaining_key, handshake_init_chaining_key, NOISE_HASH_LEN);
-	WC_DEBUG_PR_NEG_RET(mix_hash(hash, remote_static, NOISE_PUBLIC_KEY_LEN));
+	const struct noise_suite_transcript *t =
+		wg_noise_transcript_of(suite->id);
+
+	if (unlikely(!t))
+		return -EINVAL;
+
+	memcpy(hash, t->hash, NOISE_HASH_LEN);
+	memcpy(chaining_key, t->chaining_key, NOISE_HASH_LEN);
+	WC_DEBUG_PR_NEG_RET(mix_hash(hash, remote_static,
+				     suite->layout->public_key_len));
 }
 
 static int __must_check message_encrypt(u8 *dst_ciphertext, size_t dst_ciphertext_space, const u8 *src_plaintext,
@@ -604,7 +658,8 @@ wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 	/* Outbound: the suite a peer is addressed under is per-peer
 	 * configuration, which is 6ytx.28. One suite until then.
 	 */
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
+	const struct wg_suite *suite = &wg_suite_legacy;
+	const struct wg_wire_layout *l = suite->layout;
 	struct wg_initiation_view v;
 	u8 timestamp[NOISE_TIMESTAMP_LEN];
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
@@ -624,7 +679,7 @@ wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 
 	wg_wire_put_header(dst, MESSAGE_HANDSHAKE_INITIATION);
 
-	if (handshake_init(handshake->chaining_key, handshake->hash,
+	if (handshake_init(suite, handshake->chaining_key, handshake->hash,
 			   handshake->remote_static) != 0)
 		goto out;
 
@@ -680,9 +735,10 @@ out:
 
 struct wg_peer *
 wg_noise_handshake_consume_initiation(const struct wg_initiation_view *src,
-				      const struct wg_wire_layout *l,
+				      const struct wg_suite *suite,
 				      struct wg_device *wg)
 {
+	const struct wg_wire_layout *l = suite->layout;
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;
 	bool replay_attack, flood_attack;
@@ -698,7 +754,8 @@ wg_noise_handshake_consume_initiation(const struct wg_initiation_view *src,
 	if (unlikely(!wg->static_identity.has_identity))
 		goto out;
 
-	if (handshake_init(chaining_key, hash, wg->static_identity.static_public) != 0)
+	if (handshake_init(suite, chaining_key, hash,
+			   wg->static_identity.static_public) != 0)
 		goto out;
 
 	/* e */
@@ -788,7 +845,8 @@ bool wg_noise_handshake_create_response(u8 *dst, size_t dst_len,
 					struct noise_handshake *handshake)
 {
 	/* Outbound, as above: 6ytx.28. */
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
+	const struct wg_suite *suite = &wg_suite_legacy;
+	const struct wg_wire_layout *l = suite->layout;
 	struct wg_response_view v;
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
 	bool ret = false;
@@ -852,9 +910,10 @@ out:
 
 struct wg_peer *
 wg_noise_handshake_consume_response(const struct wg_response_view *src,
-				    const struct wg_wire_layout *l,
+				    const struct wg_suite *suite,
 				    struct wg_device *wg)
 {
+	const struct wg_wire_layout *l = suite->layout;
 	enum noise_handshake_state state = HANDSHAKE_ZEROED;
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;
@@ -993,3 +1052,5 @@ out:
 
 	WC_DEBUG_PR_FALSE_RET(ret);
 }
+
+#include "selftest/noise.c"

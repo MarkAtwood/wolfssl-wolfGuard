@@ -156,6 +156,11 @@ const struct wg_suite wg_suite_legacy = {
 	.layout = &wg_wire_compiled_layout,
 };
 
+const struct wg_suite *const wg_known_suites[] = {
+	&wg_suite_legacy,
+};
+const unsigned int wg_known_suites_n = ARRAY_SIZE(wg_known_suites);
+
 void wg_suite_index_init(struct wg_suite_index *ix)
 {
 	memset(ix, 0, sizeof(*ix));
