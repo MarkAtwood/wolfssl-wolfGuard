@@ -6,6 +6,7 @@
  */
 
 #include "wire.h"
+#include "wire_name.h"
 
 #include <linux/string.h>
 
@@ -211,53 +212,58 @@ int wg_suite_index_add(struct wg_suite_index *ix, const struct wg_suite *s)
 	if (unlikely(ix->n >= WG_MAX_SUITES))
 		return -ENOSPC;
 
+	/* Anything without a dynamic name is resolved by length, so admitting an
+	 * arbitrary one would rebuild the routing table this design removes. The
+	 * set is the two deployed construction strings and is closed.
+	 */
+	if (!wg_wire_name_is_dynamic(s->name) && !wg_suite_is_frozen_nameless(s)) {
+		pr_err("wolfguard: refusing suite %s: it carries no leading colon and is not one of the two frozen constructions, so nothing on the wire would identify it\n",
+		       s->name);
+		return -EINVAL;
+	}
+
 	for (i = 0; i < ix->n; ++i) {
 		const struct wg_suite *other = ix->suites[i];
 
 		if (unlikely(other->id == s->id))
 			return -EEXIST;
-		/* Length is the only thing routing has to go on, so a
-		 * collision in either handshake length makes the pair
-		 * unservable together rather than merely awkward.
+
+		/* Two nameless suites of equal initiation length cannot be told
+		 * apart, because length is all the nameless path has.
 		 */
-		if (unlikely(wg_wire_initiation_size(other->layout) == init_len ||
-			     wg_wire_response_size(other->layout) == resp_len)) {
-			pr_err("wolfguard: refusing suite %s: its handshake lengths (%zu/%zu) collide with %s, and an inbound handshake is routed by length\n",
-			       s->name, init_len, resp_len, other->name);
+		if (unlikely(!wg_wire_name_is_dynamic(s->name) &&
+			     !wg_wire_name_is_dynamic(other->name) &&
+			     wg_wire_initiation_size(other->layout) == init_len)) {
+			pr_err("wolfguard: refusing suite %s: it and %s are both nameless and both frame a %zu byte initiation\n",
+			       s->name, other->name, init_len);
+			return -EEXIST;
+		}
+
+		/* Presence of a name is decided by total length, so a named
+		 * suite that happens to arrive at a nameless suite's initiation
+		 * size would be read as nameless and fail to authenticate.
+		 */
+		if (unlikely(wg_wire_name_is_dynamic(s->name) &&
+			     !wg_wire_name_is_dynamic(other->name) &&
+			     wg_wire_initiation_size(other->layout) ==
+				     wg_wire_framed_initiation_size(s))) {
+			pr_err("wolfguard: refusing suite %s: framed with its name it is %zu bytes, the length of nameless %s\n",
+			       s->name, wg_wire_framed_initiation_size(s), other->name);
+			return -EEXIST;
+		}
+		if (unlikely(!wg_wire_name_is_dynamic(s->name) &&
+			     wg_wire_name_is_dynamic(other->name) &&
+			     wg_wire_framed_initiation_size(other) == init_len)) {
+			pr_err("wolfguard: refusing suite %s: nameless it is %zu bytes, the length %s arrives at framed with its name\n",
+			       s->name, init_len, other->name);
 			return -EEXIST;
 		}
 	}
 
+	(void)resp_len;
+
 	ix->suites[ix->n++] = s;
 	return 0;
-}
-
-const struct wg_suite *wg_suite_for_length(const struct wg_suite_index *ix,
-					   enum message_type type, size_t len)
-{
-	u8 i;
-
-	for (i = 0; i < ix->n; ++i) {
-		const struct wg_suite *s = ix->suites[i];
-		size_t want;
-
-		switch (type) {
-		case MESSAGE_HANDSHAKE_INITIATION:
-			want = wg_wire_initiation_size(s->layout);
-			break;
-		case MESSAGE_HANDSHAKE_RESPONSE:
-			want = wg_wire_response_size(s->layout);
-			break;
-		case MESSAGE_HANDSHAKE_COOKIE:
-			want = wg_wire_cookie_size(s->layout);
-			break;
-		default:
-			return NULL;
-		}
-		if (len == want)
-			return s;
-	}
-	return NULL;
 }
 
 const struct wg_suite *wg_suite_by_name(const char *name)
@@ -278,6 +284,155 @@ int wg_suite_slot(const struct wg_suite_index *ix, u8 id)
 		if (ix->suites[i]->id == id)
 			return (int)i;
 	return -1;
+}
+
+/* The two construction strings that may travel with no name. Both are
+ * deployed, neither can ever change, and that is what makes this list closed
+ * rather than merely short: every suite added from here on carries a name, so
+ * the nameless path's length comparison cannot grow.
+ */
+static const char *const frozen_nameless_names[] = {
+	"Noise_IKpsk2_SECP256R1_AesGcm_SHA256",  /* wolfGuard FIPS */
+	"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s", /* stock WireGuard */
+};
+
+bool wg_suite_is_frozen_nameless(const struct wg_suite *s)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(frozen_nameless_names); ++i) {
+		if (!strcmp(s->name, frozen_nameless_names[i]))
+			return true;
+	}
+	return false;
+}
+
+size_t wg_wire_framed_initiation_size(const struct wg_suite *s)
+{
+	size_t n = wg_wire_initiation_size(s->layout);
+
+	if (!wg_wire_name_is_dynamic(s->name))
+		return n;
+	return n + strlen(s->name) + 1;
+}
+
+bool wg_wire_split_name_tail(const u8 *data, size_t len, size_t *body_len,
+			     u8 *name_out, size_t *name_len)
+{
+	size_t n;
+
+	if (unlikely(!len))
+		return false;
+
+	n = data[len - 1];
+	if (unlikely(n < WG_NAME_MIN_LEN || n > WG_NAME_MAX_LEN || len < n + 2))
+		return false;
+	if (unlikely(!wg_wire_name_valid(data + len - 1 - n, n)))
+		return false;
+
+	memcpy(name_out, data + len - 1 - n, n);
+	*name_len = n;
+	*body_len = len - 1 - n;
+	return true;
+}
+
+size_t wg_wire_append_name_tail(u8 *data, size_t len, size_t cap,
+				const char *name)
+{
+	size_t n = strlen(name);
+
+	if (unlikely(n < WG_NAME_MIN_LEN || n > WG_NAME_MAX_LEN))
+		return 0;
+	if (unlikely(len + n + 1 > cap))
+		return 0;
+
+	memcpy(data + len, name, n);
+	data[len + n] = (u8)n;
+	return len + n + 1;
+}
+
+const struct wg_suite *wg_suite_by_wire_name(const struct wg_suite_index *ix,
+					     const u8 *name, size_t len)
+{
+	u8 i;
+
+	for (i = 0; i < ix->n; ++i) {
+		const struct wg_suite *s = ix->suites[i];
+
+		if (!wg_wire_name_is_dynamic(s->name))
+			continue;
+		if (strlen(s->name) == len && !memcmp(s->name, name, len))
+			return s;
+	}
+	return NULL;
+}
+
+const struct wg_suite *wg_suite_nameless_for_length(const struct wg_suite_index *ix,
+						    size_t len)
+{
+	u8 i;
+
+	for (i = 0; i < ix->n; ++i) {
+		const struct wg_suite *s = ix->suites[i];
+
+		if (wg_wire_name_is_dynamic(s->name))
+			continue;
+		if (wg_wire_initiation_size(s->layout) == len)
+			return s;
+	}
+	return NULL;
+}
+
+bool wg_suite_index_admits_handshake(const struct wg_suite_index *ix,
+				     enum message_type type, size_t len)
+{
+	u8 i;
+
+	for (i = 0; i < ix->n; ++i) {
+		const struct wg_suite *s = ix->suites[i];
+
+		switch (type) {
+		case MESSAGE_HANDSHAKE_INITIATION:
+			if (wg_wire_framed_initiation_size(s) == len)
+				return true;
+			break;
+		case MESSAGE_HANDSHAKE_RESPONSE:
+			if (wg_wire_response_size(s->layout) == len)
+				return true;
+			break;
+		case MESSAGE_HANDSHAKE_COOKIE:
+			if (wg_wire_cookie_size(s->layout) == len)
+				return true;
+			break;
+		default:
+			return false;
+		}
+	}
+	return false;
+}
+
+bool wg_wire_receiver_index(enum message_type type, const u8 *data, size_t len,
+			    __le32 *out)
+{
+	size_t off;
+
+	switch (type) {
+	case MESSAGE_HANDSHAKE_RESPONSE:
+		/* type, sender, then receiver. */
+		off = WG_WIRE_HEADER_LEN + WG_WIRE_INDEX_LEN;
+		break;
+	case MESSAGE_HANDSHAKE_COOKIE:
+		/* type, then receiver. */
+		off = WG_WIRE_HEADER_LEN;
+		break;
+	default:
+		return false;
+	}
+
+	if (unlikely(len < off + WG_WIRE_INDEX_LEN))
+		return false;
+	*out = wg_wire_get_index(data + off);
+	return true;
 }
 
 const struct wg_suite *wg_suite_by_id(const struct wg_suite_index *ix, u8 id)

@@ -49,7 +49,24 @@ static int __must_check wg_packet_send_handshake_initiation(struct wg_peer *peer
 						 &peer->handshake)) {
 		ret = wg_cookie_add_mac_to_packet(packet, packet_len, peer);
 		if (ret == 0) {
-			ret = wg_socket_send_buffer_to_peer(peer, packet, packet_len,
+			/* The name goes on after the MACs, because it sits
+			 * outside both of them and needs no MAC: altering it in
+			 * flight changes the initial chaining key, so every key
+			 * derived afterwards is wrong and the handshake fails.
+			 * The two frozen constructions send none and stay
+			 * byte-identical to what deploys today.
+			 */
+			size_t wire_len = packet_len;
+
+			if (wg_wire_name_is_dynamic(peer->handshake.suite->name)) {
+				wire_len = wg_wire_append_name_tail(
+					packet, packet_len, sizeof(packet),
+					peer->handshake.suite->name);
+				if (unlikely(!wire_len))
+					return -EMSGSIZE;
+			}
+
+			ret = wg_socket_send_buffer_to_peer(peer, packet, wire_len,
 							    HANDSHAKE_DSCP);
 			if (ret == 0) {
 				atomic64_set(&peer->last_sent_handshake,

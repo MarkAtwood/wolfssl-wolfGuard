@@ -11,6 +11,7 @@
 #include "timers.h"
 #include "messages.h"
 #include "wire.h"
+#include "wire_name.h"
 #include "cookie.h"
 #include "socket.h"
 
@@ -41,26 +42,19 @@ static void update_rx_stats(struct wg_peer *peer, size_t len)
 
 #define SKB_TYPE_LE32(skb) (((struct message_header *)(skb)->data)->type)
 
-/* Resolve a packet's length against the device's accept set, and report which
- * suite answered.
+/* Is this length plausible for something this device serves?
  *
- * A handshake length is no longer compared against one compile-time size. It
- * is looked up, so a device serving several suites routes each packet to the
- * suite that frames that length. wg_suite_index_add guarantees initiation and
- * response lengths are unique within a set, which is what makes the answer
- * unambiguous rather than merely plausible.
+ * A sanity gate, not a router. It runs in softirq, before the packet has cost a
+ * queue slot, and it answers only whether some accepted suite puts a handshake
+ * of this type and length on the wire. WHICH suite framed it is a different
+ * question, answered later and off this path by resolve_handshake_suite, from
+ * the name an initiation carries or the index a response or cookie reply names.
  *
- * Returns the message length on success and 0 on no match. *suite_id receives
- * the suite that matched, or WG_SUITE_NONE for a data packet, which involves
- * no suite at this layer: its keypair is found by index, not by length.
+ * Returns the message length on success and 0 on no match.
  */
-static size_t validate_header_len(struct sk_buff *skb, struct wg_device *wg,
-				  u8 *suite_id)
+static size_t validate_header_len(struct sk_buff *skb, struct wg_device *wg)
 {
-	const struct wg_suite *s;
 	enum message_type type;
-
-	*suite_id = WG_SUITE_NONE;
 
 	if (unlikely(skb->len < sizeof(struct message_header)))
 		return 0;
@@ -71,19 +65,83 @@ static size_t validate_header_len(struct sk_buff *skb, struct wg_device *wg,
 		return skb->len >= MESSAGE_MINIMUM_LENGTH ?
 		       sizeof(struct message_data) : 0;
 
-	s = wg_suite_for_length(&wg->suites, type, skb->len);
-	if (unlikely(!s))
-		return 0;
+	return wg_suite_index_admits_handshake(&wg->suites, type, skb->len) ?
+	       skb->len : 0;
+}
 
-	*suite_id = s->id;
-	return skb->len;
+/* Resolve which suite framed an inbound handshake, or NULL.
+ *
+ * Told, not guessed, and each message type is told in the way that suits it.
+ *
+ * An initiation carries its suite's name, because it is the one handshake
+ * message with no index to resolve: it creates the association the others look
+ * up. The two frozen constructions carry none and are told apart by length,
+ * which is sound only because that set is closed.
+ *
+ * A response and a cookie reply name the index their recipient chose, so each
+ * reaches its suite through the peer it identifies. Type, sender and receiver
+ * sit at the same offsets under every suite, which is what makes that index
+ * readable before the framing is known. A cookie reply could not be resolved
+ * any other way: two suites differing only in hash frame identical replies,
+ * since a reply's length follows its AEAD's nonce and tag rather than the hash.
+ */
+static const struct wg_suite *resolve_handshake_suite(struct sk_buff *skb,
+						      struct wg_device *wg)
+{
+	const struct wg_suite *suite;
+	struct wg_peer *peer = NULL;
+	__le32 idx;
+
+	if (PACKET_CB(skb)->message_type == MESSAGE_HANDSHAKE_INITIATION) {
+		u8 name[WG_NAME_MAX_LEN];
+		size_t body_len, name_len;
+
+		suite = wg_suite_nameless_for_length(&wg->suites, skb->len);
+		if (suite)
+			return suite;
+
+		if (unlikely(!wg_wire_split_name_tail(skb->data, skb->len,
+						      &body_len, name,
+						      &name_len)))
+			return NULL;
+		suite = wg_suite_by_wire_name(&wg->suites, name, name_len);
+		if (unlikely(!suite))
+			return NULL;
+		if (unlikely(body_len !=
+			     wg_wire_initiation_size(suite->layout)))
+			return NULL;
+
+		/* Everything below sees exactly the message the suite framed.
+		 * The name is transport framing, outside mac1 and mac2, and is
+		 * already spent: it matched an accepted name byte for byte and
+		 * that name's hash is the transcript root, so stripping it in
+		 * flight cannot move a peer to another suite, only make the
+		 * handshake fail.
+		 */
+		skb_trim(skb, body_len);
+		return suite;
+	}
+
+	if (unlikely(!wg_wire_receiver_index(PACKET_CB(skb)->message_type,
+					     skb->data, skb->len, &idx)))
+		return NULL;
+	/* Returns a strong reference to the peer. */
+	if (unlikely(!wg_index_hashtable_lookup(wg->index_hashtable,
+						INDEX_HASHTABLE_HANDSHAKE |
+						INDEX_HASHTABLE_KEYPAIR,
+						idx, &peer)))
+		return NULL;
+	down_read(&peer->handshake.lock);
+	suite = peer->handshake.suite;
+	up_read(&peer->handshake.lock);
+	wg_peer_put(peer);
+	return suite;
 }
 
 static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
 {
 	size_t data_offset, data_len, header_len;
 	struct udphdr *udp;
-	u8 suite_id;
 
 	if (unlikely(!wg_check_packet_protocol(skb) ||
 		     skb_transport_header(skb) < skb->head ||
@@ -115,12 +173,15 @@ static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
 	if (unlikely(skb->len != data_len))
 		/* Final len does not agree with calculated len */
 		return -EINVAL;
-	header_len = validate_header_len(skb, wg, &suite_id);
+	header_len = validate_header_len(skb, wg);
 	if (unlikely(!header_len))
 		return -EINVAL;
-	/* Resolved once, here, and carried to whoever consumes the packet. */
 	PACKET_CB(skb)->message_type = le32_to_cpu(SKB_TYPE_LE32(skb));
-	PACKET_CB(skb)->suite_id = suite_id;
+	/* Which suite framed it is not known yet and is not needed here. A
+	 * handshake gets one in resolve_handshake_suite, off this path; a data
+	 * packet never needs one, since its keypair is found by index.
+	 */
+	PACKET_CB(skb)->suite_id = WG_SUITE_NONE;
 	__skb_push(skb, data_offset);
 	if (unlikely(!pskb_may_pull(skb, data_offset + header_len)))
 		return -EINVAL;
@@ -140,15 +201,15 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 	bool packet_needs_cookie;
 	bool under_load;
 	int ret;
-	/* The suite the length gate resolved in softirq. Taken from the control
-	 * block rather than re-derived, so the packet is parsed under the same
-	 * suite whose length admitted it and whose MACs were checked.
+	/* Resolved once, here, and recorded in the control block so that whoever
+	 * consumes the packet below parses it under the same suite whose MACs
+	 * were checked. The softirq gate only agreed the length was plausible.
 	 */
-	const struct wg_suite *suite =
-		wg_suite_by_id(&wg->suites, PACKET_CB(skb)->suite_id);
+	const struct wg_suite *suite = resolve_handshake_suite(skb, wg);
 
 	if (unlikely(!suite))
 		return -EBADMSG;
+	PACKET_CB(skb)->suite_id = suite->id;
 
 	if (PACKET_CB(skb)->message_type == MESSAGE_HANDSHAKE_COOKIE) {
 		struct wg_cookie_view cookie;

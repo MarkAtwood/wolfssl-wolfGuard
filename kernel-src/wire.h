@@ -48,6 +48,7 @@
 #endif
 
 #include "messages.h"
+#include "wire_name.h"
 
 /* The lengths a suite contributes to the wire format. Everything else about a
  * message is fixed: the 4-byte header, the index fields, and the timestamp
@@ -163,12 +164,18 @@ static inline size_t wg_wire_mac2_offset(const struct wg_wire_layout *l,
  * would refuse to frame one.
  */
 #define WG_WIRE_MAX_MAC_LEN WG_MAX_HASH_LEN
+
+/* The name tail is part of the bound, not an afterthought. A named suite puts
+ * its name and a length byte after the MACs, so a buffer sized from the layout
+ * alone is one name short and the send path would refuse to frame the very
+ * initiation it was sizing for.
+ */
 #define WG_WIRE_MAX_HANDSHAKE_LEN                                            \
 	(WG_WIRE_HEADER_LEN + 2 * WG_WIRE_INDEX_LEN +                        \
 	 WG_WIRE_MAX_PUBLIC_KEY_LEN +                                        \
 	 (WG_WIRE_MAX_PUBLIC_KEY_LEN + NOISE_AUTHTAG_LEN) +                  \
 	 (NOISE_TIMESTAMP_LEN + NOISE_AUTHTAG_LEN) +                         \
-	 2 * WG_WIRE_MAX_MAC_LEN)
+	 2 * WG_WIRE_MAX_MAC_LEN + WG_NAME_MAX_LEN + 1)
 
 /* Views. Each field points into the caller's buffer; none of this owns
  * anything, and a view is only valid while that buffer is.
@@ -272,34 +279,85 @@ void wg_suite_index_init(struct wg_suite_index *ix);
 /* Add a suite to a device's accept set.
  *
  * Returns -EEXIST when the suite's initiation or response length already
- * belongs to another suite in the set. Routing is BY LENGTH, so two suites
- * that frame the same initiation size are not distinguishable, and accepting
- * both would mean parsing a packet under whichever happened to be registered
- * first while its MACs were computed under the other. Refusing loudly here is
- * the whole reason this returns an error.
+ * belongs to another suite in the set.
  *
- * Cookie reply lengths are deliberately NOT part of that test; see the comment
- * on wg_suite_for_length.
+ * Two NAMED suites of equal length are fine and are no longer refused: an
+ * initiation carries its suite's name, so identical framing is not ambiguous.
+ * What is refused is anything that makes the NAMELESS path ambiguous, because
+ * those are told apart by length alone: a suite with no leading colon that is
+ * not one of the two frozen constructions, and a named suite whose framing plus
+ * its name plus the length byte lands exactly on a nameless initiation size,
+ * which would arrive looking nameless.
  */
 int wg_suite_index_add(struct wg_suite_index *ix, const struct wg_suite *s);
 
-/* Resolve an inbound handshake to a suite by its type and length, or NULL.
- *
- * Initiation and response are unambiguous, because wg_suite_index_add refuses
- * a set in which they collide.
- *
- * A cookie reply is different and this returns the FIRST match for it. A
- * cookie reply carries no public key, so two suites differing only in key
- * encoding frame identical cookie replies, which is exactly what 6ytx.22
- * proposes to serve from one build. That is fine here because the only thing
- * this resolution is used for on the cookie path is the pull length, which is
- * equal by construction in that case. The suite a cookie reply actually
- * belongs to comes from its receiver_index, which identifies the handshake and
- * therefore the suite it was begun under. 6ytx.22 has to wire that up; with
- * one suite there is nothing to get wrong.
+/* Is this one of the two construction strings permitted to travel with no name
+ * at all? Both are deployed and frozen, which is what keeps the set closed.
  */
-const struct wg_suite *wg_suite_for_length(const struct wg_suite_index *ix,
-					   enum message_type type, size_t len);
+bool wg_suite_is_frozen_nameless(const struct wg_suite *s);
+
+/* Split a received initiation into the message its suite framed and the name
+ * appended after it. False if there is no well-formed tail.
+ *
+ * name_out must have room for WG_NAME_MAX_LEN bytes and receives a copy. The
+ * length is the packet's FINAL byte rather than a fixed offset from the start,
+ * because that offset is a property of the suite the name is there to identify:
+ * reading it from the front would mean needing the answer to find the question.
+ */
+bool wg_wire_split_name_tail(const u8 *data, size_t len, size_t *body_len,
+			     u8 *name_out, size_t *name_len);
+
+/* Append a name and its length byte, returning the new total or 0 if the name
+ * will not fit in cap. The tail sits outside mac1 and mac2 and needs no MAC:
+ * altering it changes the initial chaining key, so every key derived afterwards
+ * is wrong and the handshake fails to authenticate.
+ */
+size_t wg_wire_append_name_tail(u8 *data, size_t len, size_t cap,
+				const char *name);
+
+/* The length an initiation of this suite has ON THE WIRE, which for a named
+ * suite is longer than the message its layout describes.
+ */
+size_t wg_wire_framed_initiation_size(const struct wg_suite *s);
+
+/* Resolve an initiation's suite from the exact name bytes it carried, or NULL.
+ *
+ * The match is byte-exact against the accepted name, and a suite's precomputed
+ * transcript root is the hash of exactly those bytes, so a hit here means what
+ * seeds the handshake is what the peer sent rather than a re-rendering of it.
+ */
+const struct wg_suite *wg_suite_by_wire_name(const struct wg_suite_index *ix,
+					     const u8 *name, size_t len);
+
+/* Resolve a NAMELESS initiation by its length, or NULL.
+ *
+ * Only the two frozen constructions reach this, and wg_suite_index_add keeps
+ * that set closed, so this comparison cannot grow back into the routing table
+ * it replaced.
+ */
+const struct wg_suite *wg_suite_nameless_for_length(const struct wg_suite_index *ix,
+						    size_t len);
+
+/* Would this device admit a handshake of this type and length at all?
+ *
+ * The pre-authentication length gate, and a sanity test rather than a router:
+ * it says the length is plausible for something this device serves and nothing
+ * about which suite framed it. That question is answered afterwards, by the
+ * name an initiation carries or by the index a response or cookie reply names.
+ */
+bool wg_suite_index_admits_handshake(const struct wg_suite_index *ix,
+				     enum message_type type, size_t len);
+
+/* The index a response or cookie reply names, which sits at the same offset
+ * under every suite and so is readable before the framing is known. False for
+ * a type that names none, or a packet too short to hold one.
+ *
+ * This is what lets those two messages reach their suite through the handshake
+ * or peer they identify, which is why only the initiation carries a name: it is
+ * the one handshake message that creates the association the others look up.
+ */
+bool wg_wire_receiver_index(enum message_type type, const u8 *data, size_t len,
+			    __le32 *out);
 
 const struct wg_suite *wg_suite_by_id(const struct wg_suite_index *ix, u8 id);
 
