@@ -57,6 +57,11 @@ struct wg_device {
 	 * netlink change it at runtime, is what changes that.
 	 */
 	struct wg_suite_index suites;
+	/* The suite this device uses when IT initiates, as opposed to the set
+	 * above which is what it will answer. A peer may override it
+	 * (peer->handshake.suite). Defaults to the compiled suite.
+	 */
+	const struct wg_suite *local_suite;
 	struct pubkey_hashtable *peer_hashtable;
 	struct index_hashtable *index_hashtable;
 	struct allowedips peer_allowedips;

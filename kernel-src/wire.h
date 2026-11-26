@@ -309,6 +309,12 @@ const struct wg_suite *wg_suite_by_id(const struct wg_suite_index *ix, u8 id);
  */
 int wg_suite_slot(const struct wg_suite_index *ix, u8 id);
 
+/* A suite by name, over everything this module knows rather than over one
+ * device's accept set, because configuration names a suite before any device
+ * has agreed to accept it. NULL if the name is not one we implement.
+ */
+const struct wg_suite *wg_suite_by_name(const char *name);
+
 #ifdef DEBUG
 bool wg_wire_selftest(void);
 #endif

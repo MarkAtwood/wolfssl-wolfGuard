@@ -7,6 +7,8 @@
 
 #include "wire.h"
 
+#include <linux/string.h>
+
 #include <linux/build_bug.h>
 
 /* The sizes this layout must produce, asserted at build time.
@@ -255,6 +257,16 @@ const struct wg_suite *wg_suite_for_length(const struct wg_suite_index *ix,
 		if (len == want)
 			return s;
 	}
+	return NULL;
+}
+
+const struct wg_suite *wg_suite_by_name(const char *name)
+{
+	unsigned int i;
+
+	for (i = 0; i < wg_known_suites_n; ++i)
+		if (!strcmp(wg_known_suites[i]->name, name))
+			return wg_known_suites[i];
 	return NULL;
 }
 

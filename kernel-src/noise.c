@@ -148,11 +148,12 @@ void wg_noise_handshake_init(struct noise_handshake *handshake,
 	handshake->entry.type = INDEX_HASHTABLE_HANDSHAKE;
 	handshake->entry.peer = peer;
 
-	/* The suite a peer is addressed under is per-peer configuration, which
-	 * is 6ytx.28. Until then every peer uses the one compiled in, and this
-	 * is the single place that decides it.
+	/* A new peer inherits the device's outbound suite; WGPEER_A_SUITE
+	 * overrides it per peer, and consume_initiation replaces it with
+	 * whatever an inbound handshake resolved to.
 	 */
-	handshake->suite = &wg_suite_legacy;
+	handshake->suite = peer->device->local_suite ?
+			   peer->device->local_suite : &wg_suite_legacy;
 
 	memcpy(handshake->remote_static, peer_public_key,
 	       handshake->suite->layout->public_key_len);
@@ -686,10 +687,12 @@ bool
 wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 				     struct noise_handshake *handshake)
 {
-	/* Outbound: the suite a peer is addressed under is per-peer
-	 * configuration, which is 6ytx.28. One suite until then.
+	/* The suite this peer is addressed under, set from configuration
+	 * (6ytx.28) and defaulting to the device's local_suite at peer
+	 * creation. This is what makes a device able to INITIATE under
+	 * something other than the suite it was built with.
 	 */
-	const struct wg_suite *suite = &wg_suite_legacy;
+	const struct wg_suite *suite = handshake->suite;
 	const struct wg_wire_layout *l = suite->layout;
 	struct wg_initiation_view v;
 	u8 timestamp[NOISE_TIMESTAMP_LEN];

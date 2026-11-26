@@ -28,7 +28,21 @@ static const struct nla_policy device_policy[WGDEVICE_A_MAX + 1] = {
 	[WGDEVICE_A_LISTEN_PORT]	= { .type = NLA_U16 },
 	[WGDEVICE_A_FWMARK]		= { .type = NLA_U32 },
 	[WGDEVICE_A_PEERS]		= { .type = NLA_NESTED },
-	[WGDEVICE_A_PRESHARED_KEY]	= NLA_POLICY_EXACT_LEN(NOISE_SYMMETRIC_KEY_LEN)
+	[WGDEVICE_A_PRESHARED_KEY]	= NLA_POLICY_EXACT_LEN(NOISE_SYMMETRIC_KEY_LEN),
+	/* Nested list of suite names, as WGDEVICE_A_PEERS is nested, and a
+	 * single name for the suite this device initiates under.
+	 */
+	[WGDEVICE_A_ACCEPT_SUITES]	= { .type = NLA_NESTED },
+	[WGDEVICE_A_LOCAL_SUITE]	= { .type = NLA_NUL_STRING,
+					    .len = WG_SUITE_NAME_MAX - 1 }
+};
+
+/* Entries of WGDEVICE_A_ACCEPT_SUITES: each is just a name, so the list is
+ * indexed by position the way the allowed-ip list is.
+ */
+static const struct nla_policy suite_policy[WGSUITE_A_MAX + 1] = {
+	[WGSUITE_A_NAME]		= { .type = NLA_NUL_STRING,
+					    .len = WG_SUITE_NAME_MAX - 1 }
 };
 
 static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
@@ -41,7 +55,9 @@ static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
 	[WGPEER_A_RX_BYTES]				= { .type = NLA_U64 },
 	[WGPEER_A_TX_BYTES]				= { .type = NLA_U64 },
 	[WGPEER_A_ALLOWEDIPS]				= { .type = NLA_NESTED },
-	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 }
+	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 },
+	[WGPEER_A_SUITE]				= { .type = NLA_NUL_STRING,
+							    .len = WG_SUITE_NAME_MAX - 1 }
 };
 
 static const struct nla_policy allowedip_policy[WGALLOWEDIP_A_MAX + 1] = {
@@ -122,6 +138,13 @@ get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
 	down_read(&peer->handshake.lock);
 	fail = nla_put(skb, WGPEER_A_PUBLIC_KEY, NOISE_PUBLIC_KEY_LEN,
 		       peer->handshake.remote_static);
+	/* Read under the same lock as the key: both are handshake state, and
+	 * reporting a suite that has since changed would be worse than
+	 * reporting none.
+	 */
+	if (!fail && peer->handshake.suite)
+		fail = nla_put_string(skb, WGPEER_A_SUITE,
+				      peer->handshake.suite->name);
 	up_read(&peer->handshake.lock);
 	if (fail)
 		goto err;
@@ -260,6 +283,41 @@ static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
 			}
 		}
 		up_read(&wg->static_identity.lock);
+
+		/* The accept set and the suite this device initiates under.
+		 * Nested with nla_nest_start exactly as the peer list is. A
+		 * suite set is a handful of short names, so unlike the peer
+		 * list it never needs fragmenting across messages.
+		 */
+		{
+			struct nlattr *suites_nest;
+			u8 i;
+
+			if (wg->local_suite &&
+			    nla_put_string(skb, WGDEVICE_A_LOCAL_SUITE,
+					   wg->local_suite->name))
+				goto out;
+
+			suites_nest = nla_nest_start(skb, WGDEVICE_A_ACCEPT_SUITES);
+			if (!suites_nest)
+				goto out;
+			for (i = 0; i < wg->suites.n; ++i) {
+				struct nlattr *one = nla_nest_start(skb, i);
+
+				if (!one) {
+					nla_nest_cancel(skb, suites_nest);
+					goto out;
+				}
+				if (nla_put_string(skb, WGSUITE_A_NAME,
+						   wg->suites.suites[i]->name)) {
+					nla_nest_cancel(skb, one);
+					nla_nest_cancel(skb, suites_nest);
+					goto out;
+				}
+				nla_nest_end(skb, one);
+			}
+			nla_nest_end(skb, suites_nest);
+		}
 	}
 
 	peers_nest = nla_nest_start(skb, WGDEVICE_A_PEERS);
@@ -459,6 +517,32 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
 		}
 	}
 
+	if (attrs[WGPEER_A_SUITE]) {
+		const struct wg_suite *suite =
+			wg_suite_by_name(nla_data(attrs[WGPEER_A_SUITE]));
+
+		if (!suite) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		/* The device has to accept it too, or the response to this
+		 * peer's handshake could not be processed.
+		 */
+		if (wg_suite_slot(&wg->suites, suite->id) < 0) {
+			ret = -EINVAL;
+			goto out;
+		}
+		down_write(&peer->handshake.lock);
+		peer->handshake.suite = suite;
+		up_write(&peer->handshake.lock);
+		/* This peer's cookie keys are digests under the suite's hash,
+		 * so they follow the suite.
+		 */
+		ret = wg_cookie_checker_precompute_peer_keys(peer);
+		if (ret)
+			goto out;
+	}
+
 	if (flags & WGPEER_F_REPLACE_ALLOWEDIPS)
 		wg_allowedips_remove_by_peer(&wg->peer_allowedips, peer,
 					     &wg->device_update_lock);
@@ -547,6 +631,86 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
 			nla_get_u16(info->attrs[WGDEVICE_A_LISTEN_PORT]));
 		if (ret)
 			goto out;
+	}
+
+	/* The accept set, before any peer is touched: a peer named with a suite
+	 * can only be accepted if the device already accepts it, so the set has
+	 * to be in place first. Same ordering the Go surface uses.
+	 */
+	if (info->attrs[WGDEVICE_A_ACCEPT_SUITES]) {
+		struct wg_suite_index next;
+		struct nlattr *attr;
+		int rem;
+
+		wg_suite_index_init(&next);
+		nla_for_each_nested(attr, info->attrs[WGDEVICE_A_ACCEPT_SUITES], rem) {
+			struct nlattr *sa[WGSUITE_A_MAX + 1];
+			const struct wg_suite *suite;
+
+			ret = nla_parse_nested(sa, WGSUITE_A_MAX, attr,
+					       suite_policy, NULL);
+			if (ret < 0)
+				goto out;
+			if (!sa[WGSUITE_A_NAME]) {
+				ret = -EINVAL;
+				goto out;
+			}
+			suite = wg_suite_by_name(nla_data(sa[WGSUITE_A_NAME]));
+			if (!suite) {
+				/* A name this build does not implement. Refuse
+				 * rather than silently serving a smaller set
+				 * than was asked for.
+				 */
+				ret = -EOPNOTSUPP;
+				goto out;
+			}
+			ret = wg_suite_index_add(&next, suite);
+			if (ret)
+				goto out;
+		}
+		if (!next.n) {
+			/* A device that accepts nothing can never handshake. */
+			ret = -EINVAL;
+			goto out;
+		}
+		if (!(flags & WGDEVICE_F_REPLACE_ACCEPT_SUITES)) {
+			/* Without the replace flag this is an addition, so
+			 * merge rather than overwrite, and let the collision
+			 * check refuse an unservable pair.
+			 */
+			u8 i;
+
+			for (i = 0; i < wg->suites.n; ++i) {
+				ret = wg_suite_index_add(&next, wg->suites.suites[i]);
+				if (ret && ret != -EEXIST)
+					goto out;
+			}
+		}
+		wg->suites = next;
+		/* The cookie keys are digests under each accepted suite's hash,
+		 * so they have to be rederived for the new set.
+		 */
+		ret = wg_cookie_checker_precompute_device_keys(&wg->cookie_checker);
+		if (ret)
+			goto out;
+	}
+
+	if (info->attrs[WGDEVICE_A_LOCAL_SUITE]) {
+		const struct wg_suite *suite =
+			wg_suite_by_name(nla_data(info->attrs[WGDEVICE_A_LOCAL_SUITE]));
+
+		if (!suite) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		/* A device must accept the suite it initiates under, or it
+		 * could not process the response to its own handshake.
+		 */
+		if (wg_suite_slot(&wg->suites, suite->id) < 0) {
+			ret = -EINVAL;
+			goto out;
+		}
+		wg->local_suite = suite;
 	}
 
 	if (flags & WGDEVICE_F_REPLACE_PEERS)

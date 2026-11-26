@@ -30,7 +30,7 @@ static int __must_check wg_packet_send_handshake_initiation(struct wg_peer *peer
 	 */
 	u8 packet[WG_WIRE_MAX_HANDSHAKE_LEN];
 	const size_t packet_len =
-		wg_wire_initiation_size(&wg_wire_compiled_layout);
+		wg_wire_initiation_size(peer->handshake.suite->layout);
 	int ret;
 	u64 cur_last_sent_handshake = atomic64_read(&peer->last_sent_handshake);
 	u64 speculative_last_sent_handshake;
@@ -185,8 +185,14 @@ int wg_packet_send_handshake_cookie(struct wg_device *wg,
 				     __le32 sender_index)
 {
 	u8 packet[WG_WIRE_MAX_HANDSHAKE_LEN];
-	const size_t packet_len =
-		wg_wire_cookie_size(&wg_wire_compiled_layout);
+	/* A cookie reply is framed in the suite of the packet that provoked it,
+	 * which the length gate resolved and left in the control block.
+	 */
+	const size_t packet_len = wg_wire_cookie_size(
+		wg_suite_by_id(&wg->suites, PACKET_CB(initiating_skb)->suite_id) ?
+		wg_suite_by_id(&wg->suites,
+			       PACKET_CB(initiating_skb)->suite_id)->layout :
+		&wg_wire_compiled_layout);
 	int ret;
 
 	net_dbg_skb_ratelimited("%s: Sending cookie response for denied handshake message for %pISpfsc\n",

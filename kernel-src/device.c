@@ -401,6 +401,7 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	ret = wg_suite_index_add(&wg->suites, &wg_suite_legacy);
 	if (ret)
 		goto err_zero_cookie_checker_secret;
+	wg->local_suite = &wg_suite_legacy;
 	/* NOT accepting wg_suite_sha384 yet, deliberately. Everything needed to
 	 * serve it is in place and selftested, including its precomputed
 	 * transcript, its 278/189 framing and per-suite cookie keys, but a

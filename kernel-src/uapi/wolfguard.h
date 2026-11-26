@@ -163,8 +163,34 @@ enum wg_cmd {
 
 enum wgdevice_flag {
 	WGDEVICE_F_REPLACE_PEERS = 1U << 0,
-	__WGDEVICE_F_ALL = WGDEVICE_F_REPLACE_PEERS
+	/* Replace the accept set wholesale, as WGPEER_F_REPLACE_ALLOWEDIPS
+	 * does for a peer's allowed IPs. A replace flag rather than an
+	 * unaccept operation, which is what the Go surface needs because its
+	 * line protocol is streaming: a suite set is a handful of short names
+	 * and never needs fragmenting across messages, so netlink can validate
+	 * the whole set in one go. The two surfaces mean the same thing even
+	 * where the idiom differs.
+	 */
+	WGDEVICE_F_REPLACE_ACCEPT_SUITES = 1U << 1,
+	__WGDEVICE_F_ALL = WGDEVICE_F_REPLACE_PEERS |
+			   WGDEVICE_F_REPLACE_ACCEPT_SUITES
 };
+/* Longest suite name this surface accepts, including the terminator. The
+ * longest in service is ":P-256:HKDF-SHA-384:AEAD_AES_256_GCM" at 37
+ * characters; 64 leaves room without inviting unbounded names.
+ */
+#define WG_SUITE_NAME_MAX 64
+
+/* One entry of WGDEVICE_A_ACCEPT_SUITES. A nested attribute rather than a bare
+ * string so a future entry can carry more than a name without renumbering.
+ */
+enum wgsuite_attribute {
+	WGSUITE_A_UNSPEC,
+	WGSUITE_A_NAME,
+	__WGSUITE_A_LAST
+};
+#define WGSUITE_A_MAX (__WGSUITE_A_LAST - 1)
+
 enum wgdevice_attribute {
 	WGDEVICE_A_UNSPEC,
 	WGDEVICE_A_IFINDEX,
@@ -176,6 +202,13 @@ enum wgdevice_attribute {
 	WGDEVICE_A_FWMARK,
 	WGDEVICE_A_PEERS,
 	WGDEVICE_A_PRESHARED_KEY,
+	/* The set of suites this device will answer an inbound handshake for,
+	 * as a nested list of names, and the one it uses when it initiates.
+	 * Appended rather than inserted: these numbers are the wire protocol
+	 * for the configuration surface, so an existing client keeps working.
+	 */
+	WGDEVICE_A_ACCEPT_SUITES,
+	WGDEVICE_A_LOCAL_SUITE,
 	__WGDEVICE_A_LAST
 };
 #define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)
@@ -199,6 +232,8 @@ enum wgpeer_attribute {
 	WGPEER_A_TX_BYTES,
 	WGPEER_A_ALLOWEDIPS,
 	WGPEER_A_PROTOCOL_VERSION,
+	/* The suite this peer is addressed under, by name. */
+	WGPEER_A_SUITE,
 	__WGPEER_A_LAST
 };
 #define WGPEER_A_MAX (__WGPEER_A_LAST - 1)
