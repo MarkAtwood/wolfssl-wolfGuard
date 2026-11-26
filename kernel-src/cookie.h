@@ -57,6 +57,7 @@ int __must_check wg_cookie_message_create(u8 *dst, size_t dst_len,
 			      struct sk_buff *skb, __le32 index,
 			      struct cookie_checker *checker);
 int __must_check wg_cookie_message_consume(const struct wg_cookie_view *src,
+			       const struct wg_wire_layout *l,
 			       struct wg_device *wg);
 
 #endif /* _WG_COOKIE_H */

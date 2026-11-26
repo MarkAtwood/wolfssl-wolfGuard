@@ -41,38 +41,49 @@ static void update_rx_stats(struct wg_peer *peer, size_t len)
 
 #define SKB_TYPE_LE32(skb) (((struct message_header *)(skb)->data)->type)
 
-/* The handshake lengths come from the layout rather than a struct size. With
- * one suite this still accepts exactly one length per type; 6ytx.24 turns these
- * equality tests into a search over the accepted suites, which is the whole
- * point of computing them here instead of baking them in.
+/* Resolve a packet's length against the device's accept set, and report which
+ * suite answered.
+ *
+ * A handshake length is no longer compared against one compile-time size. It
+ * is looked up, so a device serving several suites routes each packet to the
+ * suite that frames that length. wg_suite_index_add guarantees initiation and
+ * response lengths are unique within a set, which is what makes the answer
+ * unambiguous rather than merely plausible.
+ *
+ * Returns the message length on success and 0 on no match. *suite_id receives
+ * the suite that matched, or WG_SUITE_NONE for a data packet, which involves
+ * no suite at this layer: its keypair is found by index, not by length.
  */
-static size_t validate_header_len(struct sk_buff *skb)
+static size_t validate_header_len(struct sk_buff *skb, struct wg_device *wg,
+				  u8 *suite_id)
 {
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
+	const struct wg_suite *s;
+	enum message_type type;
+
+	*suite_id = WG_SUITE_NONE;
 
 	if (unlikely(skb->len < sizeof(struct message_header)))
 		return 0;
-	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_DATA) &&
-	    skb->len >= MESSAGE_MINIMUM_LENGTH)
-		return sizeof(struct message_data);
-	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION) &&
-	    skb->len == wg_wire_initiation_size(l))
-		return wg_wire_initiation_size(l);
-	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_RESPONSE) &&
-	    skb->len == wg_wire_response_size(l))
-		return wg_wire_response_size(l);
-	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE) &&
-	    skb->len == wg_wire_cookie_size(l))
-		return wg_wire_cookie_size(l);
-	return 0;
+
+	type = le32_to_cpu(SKB_TYPE_LE32(skb));
+
+	if (type == MESSAGE_DATA)
+		return skb->len >= MESSAGE_MINIMUM_LENGTH ?
+		       sizeof(struct message_data) : 0;
+
+	s = wg_suite_for_length(&wg->suites, type, skb->len);
+	if (unlikely(!s))
+		return 0;
+
+	*suite_id = s->id;
+	return skb->len;
 }
 
 static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
 {
 	size_t data_offset, data_len, header_len;
 	struct udphdr *udp;
-
-	(void)wg;
+	u8 suite_id;
 
 	if (unlikely(!wg_check_packet_protocol(skb) ||
 		     skb_transport_header(skb) < skb->head ||
@@ -104,11 +115,12 @@ static int prepare_skb_header(struct sk_buff *skb, struct wg_device *wg)
 	if (unlikely(skb->len != data_len))
 		/* Final len does not agree with calculated len */
 		return -EINVAL;
-	header_len = validate_header_len(skb);
+	header_len = validate_header_len(skb, wg, &suite_id);
 	if (unlikely(!header_len))
 		return -EINVAL;
 	/* Resolved once, here, and carried to whoever consumes the packet. */
 	PACKET_CB(skb)->message_type = le32_to_cpu(SKB_TYPE_LE32(skb));
+	PACKET_CB(skb)->suite_id = suite_id;
 	__skb_push(skb, data_offset);
 	if (unlikely(!pskb_may_pull(skb, data_offset + header_len)))
 		return -EINVAL;
@@ -128,16 +140,25 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 	bool packet_needs_cookie;
 	bool under_load;
 	int ret;
+	/* The suite the length gate resolved in softirq. Taken from the control
+	 * block rather than re-derived, so the packet is parsed under the same
+	 * suite whose length admitted it and whose MACs were checked.
+	 */
+	const struct wg_suite *suite =
+		wg_suite_by_id(&wg->suites, PACKET_CB(skb)->suite_id);
+
+	if (unlikely(!suite))
+		return -EBADMSG;
 
 	if (PACKET_CB(skb)->message_type == MESSAGE_HANDSHAKE_COOKIE) {
 		struct wg_cookie_view cookie;
 
 		net_dbg_skb_ratelimited("%s: Receiving cookie response from %pISpfsc\n",
 					wg->dev->name, skb);
-		if (unlikely(!wg_wire_view_cookie(&cookie, &wg_wire_compiled_layout,
+		if (unlikely(!wg_wire_view_cookie(&cookie, suite->layout,
 						  skb->data, skb->len)))
 			return -EBADMSG;
-		return wg_cookie_message_consume(&cookie, wg);
+		return wg_cookie_message_consume(&cookie, suite->layout, wg);
 	}
 
 	under_load = skb_queue_len(&wg->incoming_handshakes) >=
@@ -166,8 +187,7 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 	case MESSAGE_HANDSHAKE_INITIATION: {
 		struct wg_initiation_view message;
 
-		if (unlikely(!wg_wire_view_initiation(&message,
-						      &wg_wire_compiled_layout,
+		if (unlikely(!wg_wire_view_initiation(&message, suite->layout,
 						      skb->data, skb->len)))
 			return -EBADMSG;
 
@@ -175,7 +195,8 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 			return wg_packet_send_handshake_cookie(wg, skb,
 					wg_wire_get_index(message.sender_index));
 		}
-		peer = wg_noise_handshake_consume_initiation(&message, wg);
+		peer = wg_noise_handshake_consume_initiation(&message,
+							    suite->layout, wg);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake initiation from %pISpfsc\n",
 						wg->dev->name, skb);
@@ -198,8 +219,7 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 	case MESSAGE_HANDSHAKE_RESPONSE: {
 		struct wg_response_view message;
 
-		if (unlikely(!wg_wire_view_response(&message,
-						    &wg_wire_compiled_layout,
+		if (unlikely(!wg_wire_view_response(&message, suite->layout,
 						    skb->data, skb->len)))
 			return -EBADMSG;
 
@@ -207,7 +227,8 @@ static int wg_receive_handshake_packet(struct wg_device *wg,
 			return wg_packet_send_handshake_cookie(wg, skb,
 					wg_wire_get_index(message.sender_index));
 		}
-		peer = wg_noise_handshake_consume_response(&message, wg);
+		peer = wg_noise_handshake_consume_response(&message,
+							  suite->layout, wg);
 		if (unlikely(!peer)) {
 			net_dbg_skb_ratelimited("%s: Invalid handshake response from %pISpfsc\n",
 						wg->dev->name, skb);

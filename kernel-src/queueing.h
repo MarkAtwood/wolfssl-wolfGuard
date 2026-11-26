@@ -82,6 +82,12 @@ struct packet_cb {
 	 * padding, inside a 48 byte skb->cb.
 	 */
 	u8 message_type;
+	/* The suite the length gate resolved, as a wg_suite id, or
+	 * WG_SUITE_NONE for a data packet where no suite is involved. This is
+	 * the field the comment above anticipated: resolving it twice could
+	 * have a packet MAC'd under one suite and parsed under another.
+	 */
+	u8 suite_id;
 };
 
 #define PACKET_CB(skb) ((struct packet_cb *)((skb)->cb))

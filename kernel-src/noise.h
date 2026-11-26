@@ -131,12 +131,14 @@ wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 				     struct noise_handshake *handshake);
 struct wg_peer *
 wg_noise_handshake_consume_initiation(const struct wg_initiation_view *src,
+				      const struct wg_wire_layout *l,
 				      struct wg_device *wg);
 
 bool wg_noise_handshake_create_response(u8 *dst, size_t dst_len,
 					struct noise_handshake *handshake);
 struct wg_peer *
 wg_noise_handshake_consume_response(const struct wg_response_view *src,
+				    const struct wg_wire_layout *l,
 				    struct wg_device *wg);
 
 bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,

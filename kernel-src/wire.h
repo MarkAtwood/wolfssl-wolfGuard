@@ -191,6 +191,75 @@ bool wg_wire_view_cookie(struct wg_cookie_view *v,
 /* Write a message header. Build paths call this first, then fill the view. */
 void wg_wire_put_header(u8 *data, enum message_type type);
 
+/* A suite, as far as the wire is concerned: an identifier and the lengths it
+ * contributes. The per-suite transcript tables, which is the rest of what a
+ * suite means, are 6ytx.26 and .27. The layout is a pointer rather than a
+ * value so there is exactly one definition of each suite's lengths.
+ */
+struct wg_suite {
+	u8 id;
+	const char *name;
+	const struct wg_wire_layout *layout;
+};
+
+enum wg_suite_ids {
+	WG_SUITE_NONE = 0,
+	WG_SUITE_LEGACY = 1,
+};
+
+extern const struct wg_suite wg_suite_legacy;
+
+/* Small enough that the index is a linear scan. There is no point in a hash
+ * table for a handful of entries, and the scan runs once per handshake packet,
+ * not per data packet.
+ */
+enum { WG_MAX_SUITES = 4 };
+
+/* The per-device accept set, indexed by nothing: a scan is the index. An
+ * inbound handshake is routed to a suite by its length, so this is what
+ * decides which suites a device will answer for.
+ */
+struct wg_suite_index {
+	u8 n;
+	const struct wg_suite *suites[WG_MAX_SUITES];
+};
+
+void wg_suite_index_init(struct wg_suite_index *ix);
+
+/* Add a suite to a device's accept set.
+ *
+ * Returns -EEXIST when the suite's initiation or response length already
+ * belongs to another suite in the set. Routing is BY LENGTH, so two suites
+ * that frame the same initiation size are not distinguishable, and accepting
+ * both would mean parsing a packet under whichever happened to be registered
+ * first while its MACs were computed under the other. Refusing loudly here is
+ * the whole reason this returns an error.
+ *
+ * Cookie reply lengths are deliberately NOT part of that test; see the comment
+ * on wg_suite_for_length.
+ */
+int wg_suite_index_add(struct wg_suite_index *ix, const struct wg_suite *s);
+
+/* Resolve an inbound handshake to a suite by its type and length, or NULL.
+ *
+ * Initiation and response are unambiguous, because wg_suite_index_add refuses
+ * a set in which they collide.
+ *
+ * A cookie reply is different and this returns the FIRST match for it. A
+ * cookie reply carries no public key, so two suites differing only in key
+ * encoding frame identical cookie replies, which is exactly what 6ytx.22
+ * proposes to serve from one build. That is fine here because the only thing
+ * this resolution is used for on the cookie path is the pull length, which is
+ * equal by construction in that case. The suite a cookie reply actually
+ * belongs to comes from its receiver_index, which identifies the handshake and
+ * therefore the suite it was begun under. 6ytx.22 has to wire that up; with
+ * one suite there is nothing to get wrong.
+ */
+const struct wg_suite *wg_suite_for_length(const struct wg_suite_index *ix,
+					   enum message_type type, size_t len);
+
+const struct wg_suite *wg_suite_by_id(const struct wg_suite_index *ix, u8 id);
+
 #ifdef DEBUG
 bool wg_wire_selftest(void);
 #endif

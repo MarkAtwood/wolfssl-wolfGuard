@@ -392,6 +392,16 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	mutex_init(&wg->device_update_lock);
 	skb_queue_head_init(&wg->incoming_handshakes);
 	wg_allowedips_init(&wg->peer_allowedips);
+
+	/* The accept set starts as the one suite this module is built with.
+	 * 6ytx.28 adds the netlink surface that lets it be changed, and
+	 * 6ytx.26 and .27 add the suites worth adding.
+	 */
+	wg_suite_index_init(&wg->suites);
+	ret = wg_suite_index_add(&wg->suites, &wg_suite_legacy);
+	if (ret)
+		goto err_zero_cookie_checker_secret;
+
 	ret = wg_cookie_checker_init(&wg->cookie_checker, wg);
 	if (ret)
 		goto err_zero_cookie_checker_secret;

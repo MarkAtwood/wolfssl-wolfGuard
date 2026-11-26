@@ -7,6 +7,7 @@
 
 #include "cookie.h"
 #include "wire.h"
+#include "queueing.h"
 #include "peer.h"
 #include "device.h"
 #include "messages.h"
@@ -88,21 +89,25 @@ void wg_cookie_init(struct cookie *cookie)
  * which is why this works from the total length and does not need to know
  * which of the two it is looking at.
  *
- * 6ytx.24 replaces wg_wire_compiled_layout here with the layout of the suite
- * the packet routed to. Until then there is one suite and this is it.
+ * The layout is a parameter because the covered length depends on the MAC
+ * length, which the suite sets. An inbound packet's layout comes from the
+ * suite its length routed to; an outbound one's comes from the suite being
+ * sent under.
  */
-static int __must_check compute_mac1(u8 mac1[COOKIE_LEN], const void *message, size_t len,
+static int __must_check compute_mac1(const struct wg_wire_layout *l,
+			 u8 mac1[COOKIE_LEN], const void *message, size_t len,
 			 const u8 key[NOISE_SYMMETRIC_KEY_LEN])
 {
-	len = wg_wire_mac1_offset(&wg_wire_compiled_layout, len);
+	len = wg_wire_mac1_offset(l, len);
 	return wc_hmac_oneshot(WC_SHA256, mac1, COOKIE_LEN, message, len, key,
 			       NOISE_SYMMETRIC_KEY_LEN);
 }
 
-static int __must_check compute_mac2(u8 mac2[COOKIE_LEN], const void *message, size_t len,
+static int __must_check compute_mac2(const struct wg_wire_layout *l,
+			 u8 mac2[COOKIE_LEN], const void *message, size_t len,
 			 const u8 cookie[COOKIE_LEN])
 {
-	len = wg_wire_mac2_offset(&wg_wire_compiled_layout, len);
+	len = wg_wire_mac2_offset(l, len);
 	return wc_hmac_oneshot(WC_SHA256, mac2, COOKIE_LEN, message, len, cookie,
 			       COOKIE_LEN);
 }
@@ -164,15 +169,23 @@ enum cookie_mac_state __must_check wg_cookie_validate_packet(struct cookie_check
 						struct sk_buff *skb,
 						bool check_cookie)
 {
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
-	const u8 *mac1 = skb->data + wg_wire_mac1_offset(l, skb->len);
-	const u8 *mac2 = skb->data + wg_wire_mac2_offset(l, skb->len);
+	/* The suite the length gate resolved for this packet. */
+	const struct wg_suite *s =
+		wg_suite_by_id(&checker->device->suites, PACKET_CB(skb)->suite_id);
+	const struct wg_wire_layout *l;
+	const u8 *mac1, *mac2;
 	enum cookie_mac_state ret;
 	u8 computed_mac[COOKIE_LEN];
 	u8 cookie[COOKIE_LEN];
 
 	ret = INVALID_MAC;
-	if (compute_mac1(computed_mac, skb->data, skb->len,
+	if (unlikely(!s))
+		goto out;
+	l = s->layout;
+	mac1 = skb->data + wg_wire_mac1_offset(l, skb->len);
+	mac2 = skb->data + wg_wire_mac2_offset(l, skb->len);
+
+	if (compute_mac1(l, computed_mac, skb->data, skb->len,
 			 checker->message_mac1_key) != 0)
 		goto out;
 	if (ConstantCompare(computed_mac, mac1, COOKIE_LEN))
@@ -186,7 +199,7 @@ enum cookie_mac_state __must_check wg_cookie_validate_packet(struct cookie_check
 	if (make_cookie(cookie, skb, checker) != 0)
 		goto out;
 
-	if (compute_mac2(computed_mac, skb->data, skb->len, cookie) != 0)
+	if (compute_mac2(l, computed_mac, skb->data, skb->len, cookie) != 0)
 		goto out_with_cookie;
 
 	if (ConstantCompare(computed_mac, mac2, COOKIE_LEN))
@@ -213,12 +226,16 @@ int __must_check wg_cookie_add_mac_to_packet(void *message, size_t len,
 				 struct wg_peer *peer)
 {
 	int ret;
+	/* Outbound, so there is no received packet to take a suite from. The
+	 * suite a peer is addressed under is per-peer configuration, which is
+	 * 6ytx.28; until then a device sends under the one it is built with.
+	 */
 	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	u8 *mac1 = (u8 *)message + wg_wire_mac1_offset(l, len);
 	u8 *mac2 = (u8 *)message + wg_wire_mac2_offset(l, len);
 
 	down_write(&peer->latest_cookie.lock);
-	ret = compute_mac1(mac1, message, len,
+	ret = compute_mac1(l, mac1, message, len,
 		     peer->latest_cookie.message_mac1_key);
 	if (ret != 0) {
 		up_write(&peer->latest_cookie.lock);
@@ -232,7 +249,7 @@ int __must_check wg_cookie_add_mac_to_packet(void *message, size_t len,
 	if (peer->latest_cookie.is_valid &&
 	    !wg_birthdate_has_expired(peer->latest_cookie.birthdate,
 				COOKIE_SECRET_MAX_AGE - COOKIE_SECRET_LATENCY))
-		ret = compute_mac2(mac2, message, len,
+		ret = compute_mac2(l, mac2, message, len,
 			     peer->latest_cookie.cookie);
 	else
 		memset(mac2, 0, COOKIE_LEN);
@@ -249,11 +266,24 @@ int __must_check wg_cookie_message_create(u8 *dst, size_t dst_len,
 			      struct sk_buff *skb, __le32 index,
 			      struct cookie_checker *checker)
 {
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
-	const u8 *mac1 = skb->data + wg_wire_mac1_offset(l, skb->len);
+	/* Two layouts could differ here in principle: the one the received
+	 * packet was framed under, which fixes where its mac1 sits, and the one
+	 * the reply is framed under. They are the same suite today, and a
+	 * cookie reply is sent under the suite of the packet that provoked it,
+	 * so one layout is correct rather than merely convenient.
+	 */
+	const struct wg_suite *s =
+		wg_suite_by_id(&checker->device->suites, PACKET_CB(skb)->suite_id);
+	const struct wg_wire_layout *l;
+	const u8 *mac1;
 	struct wg_cookie_view v;
 	u8 cookie[COOKIE_LEN];
 	int ret;
+
+	if (unlikely(!s))
+		return -EINVAL;
+	l = s->layout;
+	mac1 = skb->data + wg_wire_mac1_offset(l, skb->len);
 
 	if (unlikely(!wg_wire_view_cookie(&v, l, dst, dst_len)))
 		return -EINVAL;
@@ -279,9 +309,9 @@ int __must_check wg_cookie_message_create(u8 *dst, size_t dst_len,
 }
 
 int __must_check wg_cookie_message_consume(const struct wg_cookie_view *src,
+			       const struct wg_wire_layout *l,
 			       struct wg_device *wg)
 {
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	struct wg_peer *peer = NULL;
 	u8 cookie[COOKIE_LEN];
 	int ret = 0;

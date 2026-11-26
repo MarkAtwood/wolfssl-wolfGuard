@@ -12,6 +12,7 @@
 #include "allowedips.h"
 #include "peerlookup.h"
 #include "cookie.h"
+#include "wire.h"
 
 #include <linux/types.h>
 #include <linux/netdevice.h>
@@ -50,6 +51,12 @@ struct wg_device {
 	int incoming_handshake_cpu;
 	struct multicore_worker __percpu *incoming_handshakes_worker;
 	struct cookie_checker cookie_checker;
+	/* Which suites this device will answer an inbound handshake for.
+	 * Read in softirq on every handshake packet and written only at
+	 * device creation, so it needs no lock today; 6ytx.28, which lets
+	 * netlink change it at runtime, is what changes that.
+	 */
+	struct wg_suite_index suites;
 	struct pubkey_hashtable *peer_hashtable;
 	struct index_hashtable *index_hashtable;
 	struct allowedips peer_allowedips;

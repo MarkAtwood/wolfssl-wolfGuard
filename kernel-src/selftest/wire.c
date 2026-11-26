@@ -91,6 +91,90 @@ bool __init wg_wire_selftest(void)
 		}
 	}
 
+	/* --- the length-to-suite index --- */
+	{
+		struct wg_suite_index ix;
+		/* Same lengths as the legacy suite, different id. Routing has
+		 * only the length to go on, so a set holding both would parse
+		 * a packet under whichever was registered first while its MACs
+		 * were computed under the other. This must be refused.
+		 */
+		static const struct wg_suite collides = {
+			.id = 42,
+			.name = "same-lengths-different-id",
+			.layout = &wg_wire_compiled_layout,
+		};
+		/* A plausible second suite: SHA-384 doubles nothing but the MAC
+		 * and cookie lengths, which is enough to make every handshake
+		 * length differ, so this one is servable alongside the legacy.
+		 */
+		static const struct wg_wire_layout sha384 = {
+			.public_key_len = NOISE_PUBLIC_KEY_LEN,
+			.authtag_len = NOISE_AUTHTAG_LEN,
+			.mac_len = 48,
+			.cookie_len = 48,
+			.cookie_nonce_len = COOKIE_NONCE_LEN,
+		};
+		static const struct wg_suite distinct = {
+			.id = 43,
+			.name = "distinct-lengths",
+			.layout = &sha384,
+		};
+
+		wg_suite_index_init(&ix);
+		T(ix.n == 0, "a fresh index is not empty");
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION, 246) == NULL,
+		  "an empty index resolved an initiation");
+
+		T(wg_suite_index_add(&ix, &wg_suite_legacy) == 0,
+		  "the legacy suite was refused");
+		T(ix.n == 1, "the index holds %u suites, want 1", ix.n);
+
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION, 246) ==
+		  &wg_suite_legacy, "a 246 byte initiation did not resolve");
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_RESPONSE, 157) ==
+		  &wg_suite_legacy, "a 157 byte response did not resolve");
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_COOKIE, 72) ==
+		  &wg_suite_legacy, "a 72 byte cookie did not resolve");
+
+		/* A length belonging to no suite, and a length belonging to the
+		 * wrong type, both have to miss. The second is the one that
+		 * would let a response be parsed as an initiation.
+		 */
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION, 245) == NULL,
+		  "a 245 byte initiation resolved");
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION, 157) == NULL,
+		  "a response length resolved as an initiation");
+		T(wg_suite_for_length(&ix, MESSAGE_DATA, 246) == NULL,
+		  "a data message resolved to a suite");
+
+		T(wg_suite_by_id(&ix, WG_SUITE_LEGACY) == &wg_suite_legacy,
+		  "lookup by id failed");
+		T(wg_suite_by_id(&ix, 99) == NULL, "an unknown id resolved");
+
+		/* The same suite twice, by id. */
+		T(wg_suite_index_add(&ix, &wg_suite_legacy) == -EEXIST,
+		  "the same suite was added twice");
+
+		/* The real hazard: a different suite with colliding lengths. */
+		T(wg_suite_index_add(&ix, &collides) == -EEXIST,
+		  "a suite with colliding handshake lengths was accepted");
+		T(ix.n == 1, "a refused add still grew the index to %u", ix.n);
+
+		/* And a suite that does not collide is accepted, so the check
+		 * is not simply refusing everything.
+		 */
+		T(wg_suite_index_add(&ix, &distinct) == 0,
+		  "a suite with distinct lengths was refused");
+		T(ix.n == 2, "the index holds %u suites, want 2", ix.n);
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION,
+				      wg_wire_initiation_size(&sha384)) == &distinct,
+		  "the second suite's initiation did not resolve to it");
+		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION, 246) ==
+		  &wg_suite_legacy,
+		  "adding a second suite broke the first one's routing");
+	}
+
 #undef T
 
 	if (success)

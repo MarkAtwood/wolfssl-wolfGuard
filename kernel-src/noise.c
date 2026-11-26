@@ -601,6 +601,9 @@ bool
 wg_noise_handshake_create_initiation(u8 *dst, size_t dst_len,
 				     struct noise_handshake *handshake)
 {
+	/* Outbound: the suite a peer is addressed under is per-peer
+	 * configuration, which is 6ytx.28. One suite until then.
+	 */
 	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	struct wg_initiation_view v;
 	u8 timestamp[NOISE_TIMESTAMP_LEN];
@@ -677,9 +680,9 @@ out:
 
 struct wg_peer *
 wg_noise_handshake_consume_initiation(const struct wg_initiation_view *src,
+				      const struct wg_wire_layout *l,
 				      struct wg_device *wg)
 {
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;
 	bool replay_attack, flood_attack;
@@ -784,6 +787,7 @@ out:
 bool wg_noise_handshake_create_response(u8 *dst, size_t dst_len,
 					struct noise_handshake *handshake)
 {
+	/* Outbound, as above: 6ytx.28. */
 	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	struct wg_response_view v;
 	u8 key[NOISE_SYMMETRIC_KEY_LEN];
@@ -848,9 +852,9 @@ out:
 
 struct wg_peer *
 wg_noise_handshake_consume_response(const struct wg_response_view *src,
+				    const struct wg_wire_layout *l,
 				    struct wg_device *wg)
 {
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
 	enum noise_handshake_state state = HANDSHAKE_ZEROED;
 	struct wg_peer *peer = NULL, *ret_peer = NULL;
 	struct noise_handshake *handshake;

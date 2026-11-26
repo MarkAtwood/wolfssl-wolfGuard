@@ -150,4 +150,83 @@ bool wg_wire_view_cookie(struct wg_cookie_view *v,
 	return true;
 }
 
+const struct wg_suite wg_suite_legacy = {
+	.id = WG_SUITE_LEGACY,
+	.name = "Noise_IKpsk2_SECP256R1_AesGcm_SHA256",
+	.layout = &wg_wire_compiled_layout,
+};
+
+void wg_suite_index_init(struct wg_suite_index *ix)
+{
+	memset(ix, 0, sizeof(*ix));
+}
+
+int wg_suite_index_add(struct wg_suite_index *ix, const struct wg_suite *s)
+{
+	size_t init_len = wg_wire_initiation_size(s->layout);
+	size_t resp_len = wg_wire_response_size(s->layout);
+	u8 i;
+
+	if (unlikely(ix->n >= WG_MAX_SUITES))
+		return -ENOSPC;
+
+	for (i = 0; i < ix->n; ++i) {
+		const struct wg_suite *other = ix->suites[i];
+
+		if (unlikely(other->id == s->id))
+			return -EEXIST;
+		/* Length is the only thing routing has to go on, so a
+		 * collision in either handshake length makes the pair
+		 * unservable together rather than merely awkward.
+		 */
+		if (unlikely(wg_wire_initiation_size(other->layout) == init_len ||
+			     wg_wire_response_size(other->layout) == resp_len)) {
+			pr_err("wolfguard: refusing suite %s: its handshake lengths (%zu/%zu) collide with %s, and an inbound handshake is routed by length\n",
+			       s->name, init_len, resp_len, other->name);
+			return -EEXIST;
+		}
+	}
+
+	ix->suites[ix->n++] = s;
+	return 0;
+}
+
+const struct wg_suite *wg_suite_for_length(const struct wg_suite_index *ix,
+					   enum message_type type, size_t len)
+{
+	u8 i;
+
+	for (i = 0; i < ix->n; ++i) {
+		const struct wg_suite *s = ix->suites[i];
+		size_t want;
+
+		switch (type) {
+		case MESSAGE_HANDSHAKE_INITIATION:
+			want = wg_wire_initiation_size(s->layout);
+			break;
+		case MESSAGE_HANDSHAKE_RESPONSE:
+			want = wg_wire_response_size(s->layout);
+			break;
+		case MESSAGE_HANDSHAKE_COOKIE:
+			want = wg_wire_cookie_size(s->layout);
+			break;
+		default:
+			return NULL;
+		}
+		if (len == want)
+			return s;
+	}
+	return NULL;
+}
+
+const struct wg_suite *wg_suite_by_id(const struct wg_suite_index *ix, u8 id)
+{
+	u8 i;
+
+	for (i = 0; i < ix->n; ++i)
+		if (ix->suites[i]->id == id)
+			return ix->suites[i];
+	return NULL;
+}
+
 #include "selftest/wire.c"
