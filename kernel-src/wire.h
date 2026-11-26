@@ -55,11 +55,40 @@
  */
 struct wg_wire_layout {
 	u16 public_key_len;   /* ephemeral, and the plaintext of encrypted_static */
+	u16 private_key_len;  /* not wire-facing; sizes handshake state */
+	u16 hash_len;         /* transcript hash and chaining key; not wire-facing */
+	/* The hash ALGORITHM, as a wolfCrypt enum wc_HashType. Strictly this is
+	 * not a length and so not a wire layout, but the layout is what gets
+	 * threaded to every site that needs it, and splitting the two would
+	 * mean passing both everywhere for no gain. The same value serves
+	 * hashing and HMAC, since wc_hmac_oneshot takes a wc_HashType.
+	 */
+	int hash_type;
 	u16 authtag_len;      /* AEAD tag on each encrypted field */
 	u16 mac_len;          /* mac1 and mac2, each */
 	u16 cookie_len;       /* the cookie value inside a cookie reply */
 	u16 cookie_nonce_len; /* the cookie reply's nonce */
 };
+
+/* The maxima over every suite this module knows, used to SIZE state that is
+ * not wire-facing. Handshake state is sized by these and used to the suite's
+ * length, so one struct serves every suite and nothing is reallocated per
+ * handshake.
+ *
+ * The distinction that keeps this honest: sizeof on one of those arrays is its
+ * CAPACITY and stays correct for zeroing and for bounds. A length handed to a
+ * crypto call is a SEMANTIC length and must come from the suite, because after
+ * max-sizing the two are no longer the same number. WOLFGUARD-AGILITY-6ytx.25
+ * is exactly that substitution.
+ */
+#define WG_MAX_PUBLIC_KEY_LEN NOISE_PUBLIC_KEY_LEN
+#define WG_MAX_PRIVATE_KEY_LEN NOISE_PRIVATE_KEY_LEN
+/* 48, a SHA-384 digest, not NOISE_HASH_LEN. Every buffer holding a transcript
+ * hash, chaining key, or a key derived from one is sized by this and used to
+ * the suite's hash_len. Raising it is what lets a SHA-384 suite coexist with
+ * the SHA-256 one in the same build.
+ */
+#define WG_MAX_HASH_LEN 48
 
 /* The layout of the single suite compiled into this module. Per-suite tables
  * are WOLFGUARD-AGILITY-6ytx.26 and .27; this bead lands the mechanism and
@@ -128,7 +157,12 @@ static inline size_t wg_wire_mac2_offset(const struct wg_wire_layout *l,
  * sized by this and checked against the runtime length.
  */
 #define WG_WIRE_MAX_PUBLIC_KEY_LEN WG_PUBLIC_KEY_LEN
-#define WG_WIRE_MAX_MAC_LEN NOISE_HASH_LEN
+/* 48, not NOISE_HASH_LEN: the MACs are hash-length, so a SHA-384 suite makes
+ * them 48 and the maximum handshake 282 bytes. Left at 32 this evaluates to
+ * 250, which is SHORTER than a 278-byte SHA-384 initiation, and the send path
+ * would refuse to frame one.
+ */
+#define WG_WIRE_MAX_MAC_LEN WG_MAX_HASH_LEN
 #define WG_WIRE_MAX_HANDSHAKE_LEN                                            \
 	(WG_WIRE_HEADER_LEN + 2 * WG_WIRE_INDEX_LEN +                        \
 	 WG_WIRE_MAX_PUBLIC_KEY_LEN +                                        \
@@ -205,9 +239,11 @@ struct wg_suite {
 enum wg_suite_ids {
 	WG_SUITE_NONE = 0,
 	WG_SUITE_LEGACY = 1,
+	WG_SUITE_SHA384 = 2,
 };
 
 extern const struct wg_suite wg_suite_legacy;
+extern const struct wg_suite wg_suite_sha384;
 
 /* Every suite this module knows how to speak, as opposed to the per-device
  * accept set below, which is the subset a given device will answer for.
@@ -266,6 +302,12 @@ const struct wg_suite *wg_suite_for_length(const struct wg_suite_index *ix,
 					   enum message_type type, size_t len);
 
 const struct wg_suite *wg_suite_by_id(const struct wg_suite_index *ix, u8 id);
+
+/* The suite's slot in this index, or -1. Per-suite state that a device holds,
+ * such as the cookie keys, is indexed by this rather than by suite id, so the
+ * arrays stay WG_MAX_SUITES wide instead of as wide as the id space.
+ */
+int wg_suite_slot(const struct wg_suite_index *ix, u8 id);
 
 #ifdef DEBUG
 bool wg_wire_selftest(void);

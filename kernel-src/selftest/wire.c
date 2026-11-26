@@ -104,22 +104,11 @@ bool __init wg_wire_selftest(void)
 			.name = "same-lengths-different-id",
 			.layout = &wg_wire_compiled_layout,
 		};
-		/* A plausible second suite: SHA-384 doubles nothing but the MAC
-		 * and cookie lengths, which is enough to make every handshake
-		 * length differ, so this one is servable alongside the legacy.
+		/* The real SHA-384 suite, now that one exists, rather than an
+		 * invented stand-in: its lengths differ from the legacy suite's
+		 * in both directions, so the two are servable together.
 		 */
-		static const struct wg_wire_layout sha384 = {
-			.public_key_len = NOISE_PUBLIC_KEY_LEN,
-			.authtag_len = NOISE_AUTHTAG_LEN,
-			.mac_len = 48,
-			.cookie_len = 48,
-			.cookie_nonce_len = COOKIE_NONCE_LEN,
-		};
-		static const struct wg_suite distinct = {
-			.id = 43,
-			.name = "distinct-lengths",
-			.layout = &sha384,
-		};
+		const struct wg_suite *distinct = &wg_suite_sha384;
 
 		wg_suite_index_init(&ix);
 		T(ix.n == 0, "a fresh index is not empty");
@@ -128,6 +117,12 @@ bool __init wg_wire_selftest(void)
 
 		T(wg_suite_index_add(&ix, &wg_suite_legacy) == 0,
 		  "the legacy suite was refused");
+		T(wg_wire_initiation_size(wg_suite_sha384.layout) == 278,
+		  "the SHA-384 initiation is %zu, want 278 as Go and Rust frame it",
+		  wg_wire_initiation_size(wg_suite_sha384.layout));
+		T(wg_wire_response_size(wg_suite_sha384.layout) == 189,
+		  "the SHA-384 response is %zu, want 189",
+		  wg_wire_response_size(wg_suite_sha384.layout));
 		T(ix.n == 1, "the index holds %u suites, want 1", ix.n);
 
 		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION, 246) ==
@@ -164,11 +159,11 @@ bool __init wg_wire_selftest(void)
 		/* And a suite that does not collide is accepted, so the check
 		 * is not simply refusing everything.
 		 */
-		T(wg_suite_index_add(&ix, &distinct) == 0,
+		T(wg_suite_index_add(&ix, distinct) == 0,
 		  "a suite with distinct lengths was refused");
 		T(ix.n == 2, "the index holds %u suites, want 2", ix.n);
 		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION,
-				      wg_wire_initiation_size(&sha384)) == &distinct,
+				      wg_wire_initiation_size(distinct->layout)) == distinct,
 		  "the second suite's initiation did not resolve to it");
 		T(wg_suite_for_length(&ix, MESSAGE_HANDSHAKE_INITIATION, 246) ==
 		  &wg_suite_legacy,

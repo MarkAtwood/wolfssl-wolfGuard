@@ -51,8 +51,11 @@ struct noise_keypairs {
 };
 
 struct noise_static_identity {
-	u8 static_public[NOISE_PUBLIC_KEY_LEN];
-	u8 static_private[NOISE_PRIVATE_KEY_LEN];
+	/* Sized by the maxima, used to the suite's lengths. See wire.h on why
+	 * sizeof here is capacity and not a semantic length.
+	 */
+	u8 static_public[WG_MAX_PUBLIC_KEY_LEN];
+	u8 static_private[WG_MAX_PRIVATE_KEY_LEN];
 	struct rw_semaphore lock;
 	bool has_identity;
 };
@@ -73,15 +76,27 @@ struct noise_handshake {
 
 	struct noise_static_identity *static_identity;
 
-	u8 ephemeral_private[NOISE_PRIVATE_KEY_LEN];		/* ephemeral secret key */
-	u8 remote_static[NOISE_PUBLIC_KEY_LEN];			/* long term key */
-	u8 remote_ephemeral[NOISE_PUBLIC_KEY_LEN];		/* ephemeral public key */
-	u8 precomputed_static_static[NOISE_PRIVATE_KEY_LEN];	/* precomputed shared secret */
+	/* The suite this handshake runs under, and therefore the source of
+	 * every length below. Set at init to the one the device is built with;
+	 * 6ytx.28 is what lets a peer be configured with a different one, and
+	 * 6ytx.24 already resolves it per inbound packet.
+	 */
+	const struct wg_suite *suite;
 
+	/* Sized by the maxima over supported suites, used to this suite's
+	 * lengths. None of this is wire-facing, which is what makes max-sizing
+	 * safe: it cannot change a byte of a handshake message.
+	 */
+	u8 ephemeral_private[WG_MAX_PRIVATE_KEY_LEN];		/* ephemeral secret key */
+	u8 remote_static[WG_MAX_PUBLIC_KEY_LEN];		/* long term key */
+	u8 remote_ephemeral[WG_MAX_PUBLIC_KEY_LEN];		/* ephemeral public key */
+	u8 precomputed_static_static[WG_MAX_PRIVATE_KEY_LEN];	/* precomputed shared secret */
+
+	/* 32 bytes by definition of the protocol, not by suite. */
 	u8 preshared_key[NOISE_SYMMETRIC_KEY_LEN];
 
-	u8 hash[NOISE_HASH_LEN];
-	u8 chaining_key[NOISE_HASH_LEN];
+	u8 hash[WG_MAX_HASH_LEN];
+	u8 chaining_key[WG_MAX_HASH_LEN];
 
 	u8 latest_timestamp[NOISE_TIMESTAMP_LEN];
 	__le32 remote_index;
@@ -126,8 +141,8 @@ void wg_noise_set_static_identity_private_key(
  * is per suite and not shared bookkeeping.
  */
 struct noise_suite_transcript {
-	u8 chaining_key[NOISE_HASH_LEN];
-	u8 hash[NOISE_HASH_LEN];
+	u8 chaining_key[WG_MAX_HASH_LEN];
+	u8 hash[WG_MAX_HASH_LEN];
 };
 
 const struct noise_suite_transcript *wg_noise_transcript_of(u8 suite_id);

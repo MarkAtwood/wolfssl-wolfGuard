@@ -401,6 +401,15 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	ret = wg_suite_index_add(&wg->suites, &wg_suite_legacy);
 	if (ret)
 		goto err_zero_cookie_checker_secret;
+	/* NOT accepting wg_suite_sha384 yet, deliberately. Everything needed to
+	 * serve it is in place and selftested, including its precomputed
+	 * transcript, its 278/189 framing and per-suite cookie keys, but a
+	 * SHA-384 response from this kernel is still rejected by the Go and
+	 * Rust initiators for a transcript reason not yet isolated. Registering
+	 * it would advertise a suite that does not interoperate, which is worse
+	 * than not offering it. Adding this one line is all that turns it on
+	 * once that is fixed.
+	 */
 
 	ret = wg_cookie_checker_init(&wg->cookie_checker, wg);
 	if (ret)

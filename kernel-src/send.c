@@ -135,8 +135,12 @@ out:
 int __must_check wg_packet_send_handshake_response(struct wg_peer *peer)
 {
 	u8 packet[WG_WIRE_MAX_HANDSHAKE_LEN];
+	/* The suite of the initiation being answered, not the compiled one: a
+	 * device accepting several suites replies in whichever it was asked
+	 * in, and the reply's LENGTH is what tells the initiator which.
+	 */
 	const size_t packet_len =
-		wg_wire_response_size(&wg_wire_compiled_layout);
+		wg_wire_response_size(peer->handshake.suite->layout);
 	int ret;
 
 	atomic64_set(&peer->last_sent_handshake, ktime_get_coarse_boottime_ns());

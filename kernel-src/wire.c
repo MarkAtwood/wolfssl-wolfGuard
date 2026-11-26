@@ -60,6 +60,9 @@ static_assert(WG_WIRE_MAX_HANDSHAKE_LEN >= WG_WIRE_ASSERT_COOKIE,
  */
 const struct wg_wire_layout wg_wire_compiled_layout = {
 	.public_key_len = NOISE_PUBLIC_KEY_LEN,
+	.private_key_len = NOISE_PRIVATE_KEY_LEN,
+	.hash_len = NOISE_HASH_LEN,
+	.hash_type = WC_SHA256,
 	.authtag_len = NOISE_AUTHTAG_LEN,
 	.mac_len = COOKIE_LEN,
 	.cookie_len = COOKIE_LEN,
@@ -156,8 +159,39 @@ const struct wg_suite wg_suite_legacy = {
 	.layout = &wg_wire_compiled_layout,
 };
 
+/* SHA-384 with the same P-256 key encoding and AES-GCM. Only the hash changes,
+ * which moves the MACs and the cookie:
+ *
+ *   initiation  4 + 4 + 65 + (65+16) + (12+16) + 48 + 48 = 278
+ *   response    4 + 4 + 4  + 65 + 16 + 48 + 48           = 189
+ *   cookie      4 + 4 + 16 + (48+16)                     =  88
+ *
+ * 278 and 189 are what the Go and Rust implementations frame for this suite,
+ * so the interop matrix checks them against two independent implementations.
+ * They differ from the legacy 246 and 157, which is what lets both be served
+ * from one build: wg_suite_index_add refuses suites whose handshake lengths
+ * collide, since routing has only the length to go on.
+ */
+static const struct wg_wire_layout sha384_layout = {
+	.public_key_len = NOISE_PUBLIC_KEY_LEN,
+	.private_key_len = NOISE_PRIVATE_KEY_LEN,
+	.hash_len = WC_SHA384_DIGEST_SIZE,
+	.hash_type = WC_SHA384,
+	.authtag_len = NOISE_AUTHTAG_LEN,
+	.mac_len = WC_SHA384_DIGEST_SIZE,
+	.cookie_len = WC_SHA384_DIGEST_SIZE,
+	.cookie_nonce_len = COOKIE_NONCE_LEN,
+};
+
+const struct wg_suite wg_suite_sha384 = {
+	.id = WG_SUITE_SHA384,
+	.name = ":P-256:HKDF-SHA-384:AEAD_AES_256_GCM",
+	.layout = &sha384_layout,
+};
+
 const struct wg_suite *const wg_known_suites[] = {
 	&wg_suite_legacy,
+	&wg_suite_sha384,
 };
 const unsigned int wg_known_suites_n = ARRAY_SIZE(wg_known_suites);
 
@@ -222,6 +256,16 @@ const struct wg_suite *wg_suite_for_length(const struct wg_suite_index *ix,
 			return s;
 	}
 	return NULL;
+}
+
+int wg_suite_slot(const struct wg_suite_index *ix, u8 id)
+{
+	u8 i;
+
+	for (i = 0; i < ix->n; ++i)
+		if (ix->suites[i]->id == id)
+			return (int)i;
+	return -1;
 }
 
 const struct wg_suite *wg_suite_by_id(const struct wg_suite_index *ix, u8 id)

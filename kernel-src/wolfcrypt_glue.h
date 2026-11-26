@@ -22,6 +22,7 @@
     #error libwolfssl missing ECC
 #endif
 
+#include <wolfssl/wolfcrypt/hash.h>
 #include <wolfssl/wolfcrypt/sha256.h>
 #include <wolfssl/wolfcrypt/aes.h>
 #include <wolfssl/wolfcrypt/hmac.h>
@@ -104,6 +105,61 @@ extern int wc_hmac_oneshot_prealloc(struct Hmac *wc_hmac, const int type, byte *
 
 extern int wc_hmac_oneshot(int type, byte *out, const size_t out_space, const byte *message,
 		    const size_t message_len, const byte *key, const size_t key_len);
+
+/* Hash with the algorithm named by type, rather than SHA-256 by construction.
+ * wc_HashInit/Update/Final take the same enum wc_HashType that
+ * wc_hmac_oneshot already takes, so one suite value drives both.
+ *
+ * The wc_sha256_oneshot* helpers below are kept, and still hardcode SHA-256,
+ * for wc_u64_keyed_hash: that keys a hashtable rather than the protocol, so it
+ * must NOT follow the suite. Generalising it for symmetry would make peer
+ * lookup depend on the negotiated suite, which is wrong.
+ */
+static inline int wc_hash_oneshot(int type, byte *out, const byte *message,
+				  const size_t message_len)
+{
+	wc_HashAlg h;
+	int ret;
+
+	if (message_len > UINT_MAX)
+		return -EINVAL;
+
+	ret = wc_HashInit(&h, (enum wc_HashType)type);
+	if (ret == 0)
+		ret = wc_HashUpdate(&h, (enum wc_HashType)type, message,
+				    (word32)message_len);
+	if (ret == 0)
+		ret = wc_HashFinal(&h, (enum wc_HashType)type, out);
+
+	(void)wc_HashFree(&h, (enum wc_HashType)type);
+
+	return ret;
+}
+
+static inline int wc_hash_oneshot2(int type, byte *out,
+				   const byte *message1, const size_t message1_len,
+				   const byte *message2, const size_t message2_len)
+{
+	wc_HashAlg h;
+	int ret;
+
+	if ((message1_len > UINT_MAX) || (message2_len > UINT_MAX))
+		return -EINVAL;
+
+	ret = wc_HashInit(&h, (enum wc_HashType)type);
+	if (ret == 0)
+		ret = wc_HashUpdate(&h, (enum wc_HashType)type, message1,
+				    (word32)message1_len);
+	if (ret == 0)
+		ret = wc_HashUpdate(&h, (enum wc_HashType)type, message2,
+				    (word32)message2_len);
+	if (ret == 0)
+		ret = wc_HashFinal(&h, (enum wc_HashType)type, out);
+
+	(void)wc_HashFree(&h, (enum wc_HashType)type);
+
+	return ret;
+}
 
 static inline int wc_sha256_oneshot(byte *out, const byte *message, const size_t message_len)
 {

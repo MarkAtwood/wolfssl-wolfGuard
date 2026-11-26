@@ -19,7 +19,7 @@
 int wg_cookie_checker_init(struct cookie_checker *checker,
 			    struct wg_device *wg)
 {
-	int ret = wc_get_random_bytes(checker->secret, NOISE_HASH_LEN);
+	int ret = wc_get_random_bytes(checker->secret, WG_MAX_HASH_LEN);
 	if (ret)
 		return ret;
 	init_rwsem(&checker->secret_lock);
@@ -36,46 +36,73 @@ enum { COOKIE_KEY_LABEL_LEN = 8 };
 static const u8 mac1_key_label[COOKIE_KEY_LABEL_LEN] __nonstring = "mac1----";
 static const u8 cookie_key_label[COOKIE_KEY_LABEL_LEN] __nonstring = "cookie--";
 
-static int precompute_key(u8 key[NOISE_SYMMETRIC_KEY_LEN],
-			   const u8 pubkey[NOISE_PUBLIC_KEY_LEN],
+/* The derived key IS a digest of the label and the public key, so its length
+ * is the suite's hash length and the algorithm is the suite's.
+ */
+static int precompute_key(const struct wg_wire_layout *l, u8 *key,
+			   const u8 *pubkey,
 			   const u8 label[COOKIE_KEY_LABEL_LEN])
 {
-	return wc_sha256_oneshot2(key, label, COOKIE_KEY_LABEL_LEN, pubkey, NOISE_PUBLIC_KEY_LEN);
+	return wc_hash_oneshot2(l->hash_type, key, label, COOKIE_KEY_LABEL_LEN,
+				pubkey, l->public_key_len);
 }
 
 /* Must hold peer->handshake.static_identity->lock */
+/* One set of keys per suite the device accepts. They are digests of the
+ * device's own public key under that suite's hash, so two suites with
+ * different hashes have different keys and a single set cannot serve both.
+ */
 int __must_check wg_cookie_checker_precompute_device_keys(struct cookie_checker *checker)
 {
-	int ret;
-	if (likely(checker->device->static_identity.has_identity)) {
-		ret = precompute_key(checker->cookie_encryption_key,
+	const struct wg_suite_index *ix = &checker->device->suites;
+	u8 i;
+
+	if (unlikely(!checker->device->static_identity.has_identity)) {
+		memset(checker->per_suite, 0, sizeof(checker->per_suite));
+		return 0;
+	}
+
+	for (i = 0; i < ix->n; ++i) {
+		const struct wg_wire_layout *l = ix->suites[i]->layout;
+		int ret;
+
+		ret = precompute_key(l, checker->per_suite[i].cookie_encryption_key,
 			       checker->device->static_identity.static_public,
 			       cookie_key_label);
 		if (ret)
 			return ret;
-		ret = precompute_key(checker->message_mac1_key,
+		ret = precompute_key(l, checker->per_suite[i].message_mac1_key,
 			       checker->device->static_identity.static_public,
 			       mac1_key_label);
-		return ret;
-	} else {
-		memset(checker->cookie_encryption_key, 0,
-		       NOISE_SYMMETRIC_KEY_LEN);
-		memset(checker->message_mac1_key, 0, NOISE_SYMMETRIC_KEY_LEN);
-		return 0;
+		if (ret)
+			return ret;
 	}
-	__builtin_unreachable();
+	return 0;
 }
 
+/* A peer is addressed under exactly one suite, the one its handshake records,
+ * so one set of keys per peer is right. 6ytx.28 is what lets that suite be
+ * configured per peer rather than being the device's.
+ */
 int __must_check wg_cookie_checker_precompute_peer_keys(struct wg_peer *peer)
 {
-	int ret;
-	ret = precompute_key(peer->latest_cookie.cookie_decryption_key,
-		       peer->handshake.remote_static, cookie_key_label);
-	if (ret)
-		return ret;
-	ret = precompute_key(peer->latest_cookie.message_mac1_key,
-		       peer->handshake.remote_static, mac1_key_label);
-	return ret;
+	const struct wg_suite_index *ix = &peer->device->suites;
+	u8 i;
+
+	for (i = 0; i < ix->n; ++i) {
+		const struct wg_wire_layout *l = ix->suites[i]->layout;
+		int ret;
+
+		ret = precompute_key(l, peer->latest_cookie.per_suite[i].cookie_encryption_key,
+			       peer->handshake.remote_static, cookie_key_label);
+		if (ret)
+			return ret;
+		ret = precompute_key(l, peer->latest_cookie.per_suite[i].message_mac1_key,
+			       peer->handshake.remote_static, mac1_key_label);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 void wg_cookie_init(struct cookie *cookie)
@@ -95,24 +122,25 @@ void wg_cookie_init(struct cookie *cookie)
  * sent under.
  */
 static int __must_check compute_mac1(const struct wg_wire_layout *l,
-			 u8 mac1[COOKIE_LEN], const void *message, size_t len,
-			 const u8 key[NOISE_SYMMETRIC_KEY_LEN])
+			 u8 *mac1, const void *message, size_t len,
+			 const u8 *key)
 {
 	len = wg_wire_mac1_offset(l, len);
-	return wc_hmac_oneshot(WC_SHA256, mac1, COOKIE_LEN, message, len, key,
-			       NOISE_SYMMETRIC_KEY_LEN);
+	return wc_hmac_oneshot(l->hash_type, mac1, l->mac_len, message, len, key,
+			       l->hash_len);
 }
 
 static int __must_check compute_mac2(const struct wg_wire_layout *l,
-			 u8 mac2[COOKIE_LEN], const void *message, size_t len,
-			 const u8 cookie[COOKIE_LEN])
+			 u8 *mac2, const void *message, size_t len,
+			 const u8 *cookie)
 {
 	len = wg_wire_mac2_offset(l, len);
-	return wc_hmac_oneshot(WC_SHA256, mac2, COOKIE_LEN, message, len, cookie,
-			       COOKIE_LEN);
+	return wc_hmac_oneshot(l->hash_type, mac2, l->mac_len, message, len, cookie,
+			       l->cookie_len);
 }
 
-static int __must_check make_cookie(u8 cookie[COOKIE_LEN], struct sk_buff *skb,
+static int __must_check make_cookie(const struct wg_wire_layout *l,
+			u8 *cookie, struct sk_buff *skb,
 			struct cookie_checker *checker)
 {
 	int ret;
@@ -129,7 +157,7 @@ static int __must_check make_cookie(u8 cookie[COOKIE_LEN], struct sk_buff *skb,
 	if ((ret == 0) && wg_birthdate_has_expired(checker->secret_birthdate,
 				     COOKIE_SECRET_MAX_AGE)) {
 		down_write(&checker->secret_lock);
-		ret = wc_get_random_bytes(checker->secret, NOISE_HASH_LEN);
+		ret = wc_get_random_bytes(checker->secret, WG_MAX_HASH_LEN);
 		if (ret == 0)
 			checker->secret_birthdate = ktime_get_coarse_boottime_ns();
 		up_write(&checker->secret_lock);
@@ -138,7 +166,7 @@ static int __must_check make_cookie(u8 cookie[COOKIE_LEN], struct sk_buff *skb,
 	if (ret == 0) {
 		down_read(&checker->secret_lock);
 
-		ret = wc_HmacSetKey(wc_hmac, WC_SHA256, checker->secret, NOISE_HASH_LEN);
+		ret = wc_HmacSetKey(wc_hmac, l->hash_type, checker->secret, l->hash_len);
 
 		if ((ret == 0) && (skb->protocol == htons(ETH_P_IP)))
 			ret = wc_HmacUpdate(wc_hmac, (u8 *)&ip_hdr(skb)->saddr,
@@ -175,8 +203,9 @@ enum cookie_mac_state __must_check wg_cookie_validate_packet(struct cookie_check
 	const struct wg_wire_layout *l;
 	const u8 *mac1, *mac2;
 	enum cookie_mac_state ret;
-	u8 computed_mac[COOKIE_LEN];
-	u8 cookie[COOKIE_LEN];
+	int slot;
+	u8 computed_mac[WG_MAX_HASH_LEN];
+	u8 cookie[WG_MAX_HASH_LEN];
 
 	ret = INVALID_MAC;
 	if (unlikely(!s))
@@ -185,10 +214,14 @@ enum cookie_mac_state __must_check wg_cookie_validate_packet(struct cookie_check
 	mac1 = skb->data + wg_wire_mac1_offset(l, skb->len);
 	mac2 = skb->data + wg_wire_mac2_offset(l, skb->len);
 
-	if (compute_mac1(l, computed_mac, skb->data, skb->len,
-			 checker->message_mac1_key) != 0)
+	slot = wg_suite_slot(&checker->device->suites, s->id);
+	if (unlikely(slot < 0))
 		goto out;
-	if (ConstantCompare(computed_mac, mac1, COOKIE_LEN))
+
+	if (compute_mac1(l, computed_mac, skb->data, skb->len,
+			 checker->per_suite[slot].message_mac1_key) != 0)
+		goto out;
+	if (ConstantCompare(computed_mac, mac1, l->mac_len))
 		goto out;
 
 	ret = VALID_MAC_BUT_NO_COOKIE;
@@ -196,13 +229,13 @@ enum cookie_mac_state __must_check wg_cookie_validate_packet(struct cookie_check
 	if (!check_cookie)
 		goto out;
 
-	if (make_cookie(cookie, skb, checker) != 0)
+	if (make_cookie(l, cookie, skb, checker) != 0)
 		goto out;
 
 	if (compute_mac2(l, computed_mac, skb->data, skb->len, cookie) != 0)
 		goto out_with_cookie;
 
-	if (ConstantCompare(computed_mac, mac2, COOKIE_LEN))
+	if (ConstantCompare(computed_mac, mac2, l->mac_len))
 		goto out_with_cookie;
 
 	ret = VALID_MAC_WITH_COOKIE_BUT_RATELIMITED;
@@ -226,22 +259,28 @@ int __must_check wg_cookie_add_mac_to_packet(void *message, size_t len,
 				 struct wg_peer *peer)
 {
 	int ret;
-	/* Outbound, so there is no received packet to take a suite from. The
-	 * suite a peer is addressed under is per-peer configuration, which is
-	 * 6ytx.28; until then a device sends under the one it is built with.
+	/* The suite this handshake is running under, which for a response is
+	 * the one the initiation arrived in. Using the compiled suite here
+	 * computes a SHA-256 mac over a SHA-384 message, at the wrong offsets,
+	 * and the peer silently rejects it and retries forever.
 	 */
-	const struct wg_wire_layout *l = &wg_wire_compiled_layout;
+	const struct wg_suite *suite = peer->handshake.suite;
+	const struct wg_wire_layout *l = suite->layout;
+	const int slot = wg_suite_slot(&peer->device->suites, suite->id);
 	u8 *mac1 = (u8 *)message + wg_wire_mac1_offset(l, len);
 	u8 *mac2 = (u8 *)message + wg_wire_mac2_offset(l, len);
 
+	if (unlikely(slot < 0))
+		return -EINVAL;
+
 	down_write(&peer->latest_cookie.lock);
 	ret = compute_mac1(l, mac1, message, len,
-		     peer->latest_cookie.message_mac1_key);
+		     peer->latest_cookie.per_suite[slot].message_mac1_key);
 	if (ret != 0) {
 		up_write(&peer->latest_cookie.lock);
 		return ret;
 	}
-	memcpy(peer->latest_cookie.last_mac1_sent, mac1, COOKIE_LEN);
+	memcpy(peer->latest_cookie.last_mac1_sent, mac1, l->mac_len);
 	peer->latest_cookie.have_sent_mac1 = true;
 	up_write(&peer->latest_cookie.lock);
 
@@ -252,7 +291,7 @@ int __must_check wg_cookie_add_mac_to_packet(void *message, size_t len,
 		ret = compute_mac2(l, mac2, message, len,
 			     peer->latest_cookie.cookie);
 	else
-		memset(mac2, 0, COOKIE_LEN);
+		memset(mac2, 0, l->mac_len);
 
 	up_read(&peer->latest_cookie.lock);
 	return ret;
@@ -277,12 +316,16 @@ int __must_check wg_cookie_message_create(u8 *dst, size_t dst_len,
 	const struct wg_wire_layout *l;
 	const u8 *mac1;
 	struct wg_cookie_view v;
-	u8 cookie[COOKIE_LEN];
+	int slot;
+	u8 cookie[WG_MAX_HASH_LEN];
 	int ret;
 
 	if (unlikely(!s))
 		return -EINVAL;
 	l = s->layout;
+	slot = wg_suite_slot(&checker->device->suites, s->id);
+	if (unlikely(slot < 0))
+		return -EINVAL;
 	mac1 = skb->data + wg_wire_mac1_offset(l, skb->len);
 
 	if (unlikely(!wg_wire_view_cookie(&v, l, dst, dst_len)))
@@ -293,15 +336,16 @@ int __must_check wg_cookie_message_create(u8 *dst, size_t dst_len,
 	ret = wc_get_random_bytes(v.nonce, l->cookie_nonce_len);
 
 	if (ret == 0)
-		ret = make_cookie(cookie, skb, checker);
+		ret = make_cookie(l, cookie, skb, checker);
 
 	if (ret == 0)
 		ret = wc_AesGcm_oneshot_encrypt(v.encrypted_cookie,
 					wg_wire_encrypted(l, l->cookie_len),
-					checker->cookie_encryption_key, sizeof(checker->cookie_encryption_key),
-					cookie, COOKIE_LEN,
+					checker->per_suite[slot].cookie_encryption_key,
+					l->hash_len,
+					cookie, l->cookie_len,
 					v.nonce, l->cookie_nonce_len,
-					mac1, COOKIE_LEN, NOISE_AUTHTAG_LEN);
+					mac1, l->mac_len, NOISE_AUTHTAG_LEN);
 
 	memzero_explicit(cookie, sizeof cookie);
 
@@ -313,7 +357,7 @@ int __must_check wg_cookie_message_consume(const struct wg_cookie_view *src,
 			       struct wg_device *wg)
 {
 	struct wg_peer *peer = NULL;
-	u8 cookie[COOKIE_LEN];
+	u8 cookie[WG_MAX_HASH_LEN];
 	int ret = 0;
 
 	if (unlikely(!wg_index_hashtable_lookup(wg->index_hashtable,
@@ -328,19 +372,22 @@ int __must_check wg_cookie_message_consume(const struct wg_cookie_view *src,
 		goto out;
 	}
 
-	ret = wc_AesGcm_oneshot_decrypt(cookie, (word32)sizeof(cookie),
-					peer->latest_cookie.cookie_decryption_key, sizeof(peer->latest_cookie.cookie_decryption_key),
+	ret = wc_AesGcm_oneshot_decrypt(cookie, (word32)l->cookie_len,
+					peer->latest_cookie.per_suite[
+						wg_suite_slot(&wg->suites,
+							      peer->handshake.suite->id)
+					].cookie_encryption_key, l->hash_len,
 					src->encrypted_cookie,
 					(word32)wg_wire_encrypted(l, l->cookie_len),
 					src->nonce, (word32)l->cookie_nonce_len,
-					peer->latest_cookie.last_mac1_sent, sizeof(peer->latest_cookie.last_mac1_sent),
+					peer->latest_cookie.last_mac1_sent, l->mac_len,
 					NOISE_AUTHTAG_LEN);
 
 	up_read(&peer->latest_cookie.lock);
 
 	if (ret == 0) {
 		down_write(&peer->latest_cookie.lock);
-		memcpy(peer->latest_cookie.cookie, cookie, COOKIE_LEN);
+		memcpy(peer->latest_cookie.cookie, cookie, l->cookie_len);
 		peer->latest_cookie.birthdate = ktime_get_coarse_boottime_ns();
 		peer->latest_cookie.is_valid = true;
 		peer->latest_cookie.have_sent_mac1 = false;

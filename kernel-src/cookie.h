@@ -14,23 +14,45 @@
 
 struct wg_peer;
 
+/* The mac1 and cookie keys are HASH DIGESTS of the device's public key, so
+ * their length is the suite's hash length: 32 under SHA-256 and 48 under
+ * SHA-384. A device serving both therefore needs one set per suite, indexed by
+ * the suite's slot in the device's accept set (wg_suite_slot). Holding a
+ * single set is what would break the moment a second hash is accepted, and is
+ * the substance of WOLFGUARD-AGILITY-6ytx.27.
+ */
+struct cookie_checker_keys {
+	u8 cookie_encryption_key[WG_MAX_HASH_LEN];
+	u8 message_mac1_key[WG_MAX_HASH_LEN];
+};
+
 struct cookie_checker {
-	u8 secret[NOISE_HASH_LEN];
-	u8 cookie_encryption_key[NOISE_SYMMETRIC_KEY_LEN];
-	u8 message_mac1_key[NOISE_SYMMETRIC_KEY_LEN];
+	/* Device-wide random, read at the suite's hash length. */
+	u8 secret[WG_MAX_HASH_LEN];
+	struct cookie_checker_keys per_suite[WG_MAX_SUITES];
 	u64 secret_birthdate;
 	struct rw_semaphore secret_lock;
 	struct wg_device *device;
 };
 
+/* Per peer, and every field here is hash-length dependent: the cookie value,
+ * the mac1 we last sent, and the two keys derived from the peer's public key.
+ * All sized by the maximum and used to the suite's hash length.
+ */
 struct cookie {
 	u64 birthdate;
 	bool is_valid;
-	u8 cookie[COOKIE_LEN];
+	u8 cookie[WG_MAX_HASH_LEN];
 	bool have_sent_mac1;
-	u8 last_mac1_sent[COOKIE_LEN];
-	u8 cookie_decryption_key[NOISE_SYMMETRIC_KEY_LEN];
-	u8 message_mac1_key[NOISE_SYMMETRIC_KEY_LEN];
+	u8 last_mac1_sent[WG_MAX_HASH_LEN];
+	/* One set per suite, for the same reason the device has one set per
+	 * suite: these are digests of the PEER's public key under a suite's
+	 * hash, so they differ per suite. A peer's suite is not known when the
+	 * peer is created, only once a handshake resolves one, so deriving a
+	 * single set at creation time leaves it stale the moment a handshake
+	 * arrives under a different suite.
+	 */
+	struct cookie_checker_keys per_suite[WG_MAX_SUITES];
 	struct rw_semaphore lock;
 };
 

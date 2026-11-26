@@ -33,6 +33,27 @@ bool __init wg_noise_selftest(void)
 		0x39, 0xa1, 0x3d, 0x2c, 0x42, 0x74, 0x45, 0xef,
 		0x28, 0x39, 0xcb, 0x5e, 0x21, 0x1b, 0x6a, 0x00,
 	};
+	/* The SHA-384 suite, which IS registered, checked at its own hash
+	 * length against SHA-384 vectors. This is the case the whole per-suite
+	 * transcript table exists for: a different name AND a different hash
+	 * giving a different root, with an oracle outside this module.
+	 */
+	static const u8 sha384_ck[WC_SHA384_DIGEST_SIZE] __initconst = {
+		0xed, 0x3a, 0x2b, 0x61, 0x9e, 0xfb, 0xf7, 0x55,
+		0xe2, 0x92, 0x60, 0x32, 0x52, 0xa9, 0xd4, 0xbd,
+		0x61, 0x27, 0xe5, 0x12, 0x2a, 0xb8, 0xd2, 0x50,
+		0xfa, 0xcf, 0xc3, 0xf8, 0x6b, 0x08, 0x79, 0x95,
+		0x9b, 0xa0, 0x8c, 0xff, 0x0b, 0xf0, 0x1d, 0x0b,
+		0x97, 0xa2, 0x7c, 0x1f, 0xa2, 0x16, 0xde, 0x8c,
+	};
+	static const u8 sha384_hash[WC_SHA384_DIGEST_SIZE] __initconst = {
+		0x64, 0xab, 0x5c, 0x5b, 0x46, 0xd4, 0xfc, 0xad,
+		0x8e, 0xf4, 0x3d, 0x77, 0xb0, 0x1f, 0xed, 0x35,
+		0x16, 0xf2, 0x21, 0x67, 0x49, 0xe3, 0xf7, 0x01,
+		0xab, 0x8f, 0x33, 0xa6, 0xf2, 0x06, 0x78, 0x3a,
+		0x1e, 0x60, 0xeb, 0xda, 0x19, 0xeb, 0xc5, 0x35,
+		0x73, 0xea, 0x3c, 0xf6, 0xcd, 0xa2, 0x80, 0x13,
+	};
 	/* Noise_IKpsk2_SECP256R1_C_AesGcm_SHA256, the compressed-key suite.
 	 * Not registered yet, which is 6ytx.22. Its vectors are here to show
 	 * the NAME is what varies the starting state: if it were not bound in,
@@ -74,13 +95,26 @@ bool __init wg_noise_selftest(void)
 		  "the legacy hash does not match SHA256(ChainKey || identifier)");
 	}
 
+	t = wg_noise_transcript_of(WG_SUITE_SHA384);
+	T(t != NULL, "the SHA-384 suite has no precomputed transcript");
+	if (t) {
+		T(!memcmp(t->chaining_key, sha384_ck, WC_SHA384_DIGEST_SIZE),
+		  "the SHA-384 chaining key does not match SHA384(name)");
+		T(!memcmp(t->hash, sha384_hash, WC_SHA384_DIGEST_SIZE),
+		  "the SHA-384 hash does not match SHA384(ChainKey || identifier)");
+		/* And the two suites must not share a root. */
+		T(memcmp(t->chaining_key, legacy_ck, NOISE_HASH_LEN) != 0,
+		  "the SHA-384 and legacy suites share a chaining key prefix");
+	}
+
 	T(wg_noise_transcript_of(WG_SUITE_NONE) == NULL,
 	  "WG_SUITE_NONE resolved to a transcript");
 	T(wg_noise_transcript_of(200) == NULL,
 	  "an unregistered suite id resolved to a transcript");
 
 	/* A different name must give a different root, and the right one. */
-	if (precompute_transcript(compressed_name, &scratch) == 0) {
+	if (precompute_transcript(wg_suite_legacy.layout, compressed_name,
+				  &scratch) == 0) {
 		T(!memcmp(scratch.chaining_key, compressed_ck, NOISE_HASH_LEN),
 		  "the compressed-suite chaining key is wrong");
 		T(!memcmp(scratch.hash, compressed_hash, NOISE_HASH_LEN),
