@@ -7,7 +7,10 @@
 #define CONTAINERS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <net/if.h>
@@ -48,6 +51,16 @@ struct timespec64 {
 	int64_t tv_nsec;
 };
 
+/* One entry of a device's accept set: the set of suites it will answer an
+ * inbound handshake for. A list rather than a fixed array because the set is
+ * declarative in a config file, the way AllowedIPs is, and the kernel bounds it
+ * rather than this tool.
+ */
+struct wgsuite {
+	char name[WG_SUITE_NAME_MAX];
+	struct wgsuite *next_suite;
+};
+
 struct wgallowedip {
 	uint16_t family;
 	union {
@@ -63,7 +76,8 @@ enum {
 	WGPEER_REPLACE_ALLOWEDIPS = 1U << 1,
 	WGPEER_HAS_PUBLIC_KEY = 1U << 2,
 	WGPEER_HAS_PRESHARED_KEY = 1U << 3,
-	WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL = 1U << 4
+	WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL = 1U << 4,
+	WGPEER_HAS_SUITE = 1U << 5
 };
 
 struct wgpeer {
@@ -82,6 +96,13 @@ struct wgpeer {
 	uint64_t rx_bytes, tx_bytes;
 	uint16_t persistent_keepalive_interval;
 
+	/* The suite this peer initiates with. Empty means it follows the
+	 * device's local suite, which is what an unpinned peer does; during a
+	 * migration the two are allowed to differ, and a peer part-way through
+	 * may still initiate with the old suite.
+	 */
+	char suite[WG_SUITE_NAME_MAX];
+
 	struct wgallowedip *first_allowedip, *last_allowedip;
 	struct wgpeer *next_peer;
 };
@@ -91,7 +112,15 @@ enum {
 	WGDEVICE_HAS_PRIVATE_KEY = 1U << 1,
 	WGDEVICE_HAS_PUBLIC_KEY = 1U << 2,
 	WGDEVICE_HAS_LISTEN_PORT = 1U << 3,
-	WGDEVICE_HAS_FWMARK = 1U << 4
+	WGDEVICE_HAS_FWMARK = 1U << 4,
+	WGDEVICE_HAS_LOCAL_SUITE = 1U << 5,
+	/* Replace the accept set rather than add to it, which is what a config
+	 * file means: setconf states the whole configuration, so a suite absent
+	 * from the file must stop being served. `wg set` adds instead, so that
+	 * accept-suite can bring a second suite up mid-migration without
+	 * tearing down the one carrying traffic.
+	 */
+	WGDEVICE_REPLACE_ACCEPT_SUITES = 1U << 6
 };
 
 struct wgdevice {
@@ -106,6 +135,18 @@ struct wgdevice {
 	uint32_t fwmark;
 	uint16_t listen_port;
 
+	/* The suite this device initiates with, and the default for a peer that
+	 * is not pinned to one.
+	 */
+	char local_suite[WG_SUITE_NAME_MAX];
+	struct wgsuite *first_suite, *last_suite;
+	/* Names given to `unaccept-suite`, which are NOT sent as-is: the kernel
+	 * has no remove-one operation, so set_main reads the current accept set,
+	 * subtracts these, and sends the remainder with the replace flag. Empty
+	 * for every other caller.
+	 */
+	struct wgsuite *first_unaccept_suite, *last_unaccept_suite;
+
 	struct wgpeer *first_peer, *last_peer;
 };
 
@@ -115,6 +156,32 @@ struct wgdevice {
 static inline void memzero_explicit(void *p, size_t len) {
     static void *(* const volatile memset_func)(void *, int, size_t) = memset;
     (void)memset_func(p, 0, len);
+}
+
+/* Append a name to the accept set. The caller has already decided the name is
+ * acceptable; this only bounds it and links it, so the one copy of the list
+ * manipulation serves both the parser and set_main.
+ */
+static inline bool wgdevice_add_accept_suite(struct wgdevice *dev, const char *name)
+{
+	struct wgsuite *suite = calloc(1, sizeof(*suite));
+
+	if (!suite) {
+		perror("calloc");
+		return false;
+	}
+	if (strlen(name) >= sizeof(suite->name)) {
+		free(suite);
+		return false;
+	}
+	strcpy(suite->name, name);
+	if (!dev->first_suite)
+		dev->first_suite = dev->last_suite = suite;
+	else {
+		dev->last_suite->next_suite = suite;
+		dev->last_suite = suite;
+	}
+	return true;
 }
 
 static inline void free_wgdevice(struct wgdevice *dev)
@@ -127,6 +194,10 @@ static inline void free_wgdevice(struct wgdevice *dev)
 		memzero_explicit(peer->preshared_key, sizeof peer->preshared_key);
 		free(peer);
 	}
+	for (struct wgsuite *suite = dev->first_suite, *ns = suite ? suite->next_suite : NULL; suite; suite = ns, ns = suite ? suite->next_suite : NULL)
+		free(suite);
+	for (struct wgsuite *suite = dev->first_unaccept_suite, *ns = suite ? suite->next_suite : NULL; suite; suite = ns, ns = suite ? suite->next_suite : NULL)
+		free(suite);
 	memzero_explicit(dev->private_key, sizeof dev->private_key);
 	free(dev);
 }

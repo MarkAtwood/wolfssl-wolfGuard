@@ -44,6 +44,15 @@ int showconf_main(int argc, char *argv[])
 		printf("ListenPort = %u\n", device->listen_port);
 	if (device->fwmark)
 		printf("FwMark = 0x%x\n", device->fwmark);
+	/* The accept set is printed before LocalSuite because setconf replays
+	 * this file in order and a device can only initiate with a suite it
+	 * already accepts. Printing them the other way round produces a file
+	 * that this tool itself would refuse.
+	 */
+	for (struct wgsuite *suite = device->first_suite; suite; suite = suite->next_suite)
+		printf("AcceptSuite = %s\n", suite->name);
+	if (device->flags & WGDEVICE_HAS_LOCAL_SUITE)
+		printf("LocalSuite = %s\n", device->local_suite);
 	if (device->flags & WGDEVICE_HAS_PRIVATE_KEY) {
 		if (!wg_to_base64(base64, WG_BASE64_LEN(WG_PRIVATE_KEY_LEN), device->private_key, sizeof(device->private_key))) {
 			fprintf(stderr, "wg_to_base64() failed.\n");
@@ -102,6 +111,9 @@ int showconf_main(int argc, char *argv[])
 
 		if (peer->persistent_keepalive_interval)
 			printf("PersistentKeepalive = %u\n", peer->persistent_keepalive_interval);
+
+		if (peer->flags & WGPEER_HAS_SUITE)
+			printf("Suite = %s\n", peer->suite);
 
 		if (peer->next_peer)
 			printf("\n");

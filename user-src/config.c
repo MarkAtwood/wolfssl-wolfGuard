@@ -448,6 +448,73 @@ err:
 	return false;
 }
 
+/* A suite name is checked for length and for being non-empty, and nothing
+ * else. Whether the name is one this build implements is the kernel's or the
+ * far end's judgement, not this tool's: wg(8) has never known the set of
+ * algorithms, and a tool that validated names against a baked-in list would
+ * refuse a suite a newer kernel served perfectly well.
+ */
+static bool parse_suite_name(char *dest, size_t dest_size, const char *value)
+{
+	size_t len = strlen(value);
+
+	if (!len) {
+		fprintf(stderr, "Suite name is empty\n");
+		return false;
+	}
+	if (len >= dest_size) {
+		fprintf(stderr, "Suite name is %zu characters, the maximum is %zu: `%s'\n",
+			len, dest_size - 1, value);
+		return false;
+	}
+	memcpy(dest, value, len + 1);
+	return true;
+}
+
+/* `unaccept-suite` cannot be resolved here.
+ *
+ * The kernel's configuration surface has one operation for the accept set,
+ * replace-the-whole-thing, and no remove-one. So stopping service of a single
+ * suite means reading what the device currently accepts, subtracting this name,
+ * and writing the remainder back with the replace flag. That is device I/O, and
+ * this file is a parser, so all it does is record the intent. set_main resolves
+ * it once it can talk to the device.
+ *
+ * The alternative is a netlink attribute for removal, which would let the kernel
+ * do it atomically and would match the Go tree's unaccept_suite= key more
+ * closely. That is a kernel change and a wire-format addition, so it is not
+ * taken here; see the note in set_main about what this costs.
+ */
+static bool append_unaccept_suite(struct wgdevice *device, const char *value)
+{
+	struct wgsuite *suite = calloc(1, sizeof(*suite));
+
+	if (!suite) {
+		perror("calloc");
+		return false;
+	}
+	if (!parse_suite_name(suite->name, sizeof(suite->name), value)) {
+		free(suite);
+		return false;
+	}
+	if (!device->first_unaccept_suite)
+		device->first_unaccept_suite = device->last_unaccept_suite = suite;
+	else {
+		device->last_unaccept_suite->next_suite = suite;
+		device->last_unaccept_suite = suite;
+	}
+	return true;
+}
+
+static bool append_accept_suite(struct wgdevice *device, const char *value)
+{
+	char name[WG_SUITE_NAME_MAX];
+
+	if (!parse_suite_name(name, sizeof(name), value))
+		return false;
+	return wgdevice_add_accept_suite(device, name);
+}
+
 static bool process_line(struct config_ctx *ctx, const char *line)
 {
 	const char *value;
@@ -489,6 +556,20 @@ static bool process_line(struct config_ctx *ctx, const char *line)
 			ret = parse_private_key(ctx->device->private_key, value, value_len);
 			if (ret)
 				ctx->device->flags |= WGDEVICE_HAS_PRIVATE_KEY;
+		} else if (key_match("LocalSuite")) {
+			ret = parse_suite_name(ctx->device->local_suite,
+					       sizeof(ctx->device->local_suite), value);
+			if (ret)
+				ctx->device->flags |= WGDEVICE_HAS_LOCAL_SUITE;
+		} else if (key_match("AcceptSuite")) {
+			/* Repeatable, and declarative the way AllowedIPs is:
+			 * the file states the whole accept set, so setconf
+			 * replaces rather than adds and a suite left out of the
+			 * file stops being served. There is deliberately no
+			 * UnacceptSuite key; that would be as odd in a
+			 * declarative file as a RemovePeer line.
+			 */
+			ret = append_accept_suite(ctx->device, value);
 		} else
 			goto error;
 	} else if (ctx->is_peer_section) {
@@ -506,6 +587,11 @@ static bool process_line(struct config_ctx *ctx, const char *line)
 			ret = parse_preshared_key(ctx->last_peer->preshared_key, value, value_len);
 			if (ret)
 				ctx->last_peer->flags |= WGPEER_HAS_PRESHARED_KEY;
+		} else if (key_match("Suite")) {
+			ret = parse_suite_name(ctx->last_peer->suite,
+					       sizeof(ctx->last_peer->suite), value);
+			if (ret)
+				ctx->last_peer->flags |= WGPEER_HAS_SUITE;
 		} else
 			goto error;
 	} else
@@ -628,6 +714,39 @@ struct wgdevice *config_read_cmd(char *argv[], int argc)
 		} else if (!strcmp(argv[0], "fwmark") && argc >= 2 && !peer) {
 			if (!parse_fwmark(&device->fwmark, &device->flags, argv[1]))
 				goto error;
+			argv += 2;
+			argc -= 2;
+		} else if (!strcmp(argv[0], "local-suite") && argc >= 2 && !peer) {
+			if (!parse_suite_name(device->local_suite, sizeof(device->local_suite), argv[1]))
+				goto error;
+			device->flags |= WGDEVICE_HAS_LOCAL_SUITE;
+			argv += 2;
+			argc -= 2;
+		} else if (!strcmp(argv[0], "accept-suite") && argc >= 2 && !peer) {
+			/* Additive, unlike the config file. `wg set` states a
+			 * change, not a whole configuration, so bringing a
+			 * second suite up mid-migration must not tear down the
+			 * one currently carrying traffic.
+			 */
+			if (!append_accept_suite(device, argv[1]))
+				goto error;
+			argv += 2;
+			argc -= 2;
+		} else if (!strcmp(argv[0], "unaccept-suite") && argc >= 2 && !peer) {
+			/* Stop serving one suite, which is the last step of a
+			 * migration. Expressed as a replacement accept set
+			 * holding everything currently served except this one,
+			 * because the kernel offers no remove-one operation and
+			 * inventing one would need a netlink attribute.
+			 */
+			if (!append_unaccept_suite(device, argv[1]))
+				goto error;
+			argv += 2;
+			argc -= 2;
+		} else if (!strcmp(argv[0], "suite") && argc >= 2 && peer) {
+			if (!parse_suite_name(peer->suite, sizeof(peer->suite), argv[1]))
+				goto error;
+			peer->flags |= WGPEER_HAS_SUITE;
 			argv += 2;
 			argc -= 2;
 		} else if (!strcmp(argv[0], "private-key") && argc >= 2 && !peer) {

@@ -165,8 +165,55 @@ again:
 			mnl_attr_put_u16(nlh, WGDEVICE_A_LISTEN_PORT, dev->listen_port);
 		if (dev->flags & WGDEVICE_HAS_FWMARK)
 			mnl_attr_put_u32(nlh, WGDEVICE_A_FWMARK, dev->fwmark);
+		if (dev->flags & WGDEVICE_HAS_LOCAL_SUITE)
+			mnl_attr_put_strz(nlh, WGDEVICE_A_LOCAL_SUITE, dev->local_suite);
+		if (dev->first_suite) {
+			struct nlattr *suites_nest, *suite_nest;
+			struct wgsuite *suite;
+
+			/* Each entry is its own nest holding a name, which is
+			 * what the kernel's suite_policy expects: a nested
+			 * attribute rather than a bare string, so an entry can
+			 * later carry more than a name without renumbering.
+			 */
+			/* An accept set that does not fit is an ERROR, not a
+			 * partial send. The peer and allowedip paths above
+			 * flush what they have and resume, which is right for
+			 * them because the set is additive and the remainder
+			 * follows in the next message. An accept set has no
+			 * such cursor, and quietly sending a prefix of it would
+			 * leave the device serving a suite the operator thinks
+			 * it stopped serving, or not serving one they think it
+			 * started. The kernel bounds the set at WG_MAX_SUITES
+			 * names, so this cannot be reached by a legitimate
+			 * configuration.
+			 */
+			suites_nest = mnl_attr_nest_start(nlh, WGDEVICE_A_ACCEPT_SUITES);
+			if (!suites_nest) {
+				ret = -EMSGSIZE;
+				goto out;
+			}
+			for (suite = dev->first_suite; suite; suite = suite->next_suite) {
+				suite_nest = mnl_attr_nest_start_check(nlh, SOCKET_BUFFER_SIZE, 0);
+				if (!suite_nest) {
+					mnl_attr_nest_cancel(nlh, suites_nest);
+					ret = -EMSGSIZE;
+					goto out;
+				}
+				if (!mnl_attr_put_check(nlh, SOCKET_BUFFER_SIZE, WGSUITE_A_NAME, strlen(suite->name) + 1, suite->name)) {
+					mnl_attr_nest_cancel(nlh, suite_nest);
+					mnl_attr_nest_cancel(nlh, suites_nest);
+					ret = -EMSGSIZE;
+					goto out;
+				}
+				mnl_attr_nest_end(nlh, suite_nest);
+			}
+			mnl_attr_nest_end(nlh, suites_nest);
+		}
 		if (dev->flags & WGDEVICE_REPLACE_PEERS)
 			flags |= WGDEVICE_F_REPLACE_PEERS;
+		if (dev->flags & WGDEVICE_REPLACE_ACCEPT_SUITES)
+			flags |= WGDEVICE_F_REPLACE_ACCEPT_SUITES;
 		if (flags)
 			mnl_attr_put_u32(nlh, WGDEVICE_A_FLAGS, flags);
 	}
@@ -200,6 +247,10 @@ again:
 			}
 			if (peer->flags & WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL) {
 				if (!mnl_attr_put_u16_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL, peer->persistent_keepalive_interval))
+					goto toobig_peers;
+			}
+			if (peer->flags & WGPEER_HAS_SUITE) {
+				if (!mnl_attr_put_check(nlh, SOCKET_BUFFER_SIZE, WGPEER_A_SUITE, strlen(peer->suite) + 1, peer->suite))
 					goto toobig_peers;
 			}
 		}
@@ -359,6 +410,13 @@ static int parse_peer(const struct nlattr *attr, void *data)
 		if (!mnl_attr_validate(attr, MNL_TYPE_U16))
 			peer->persistent_keepalive_interval = mnl_attr_get_u16(attr);
 		break;
+	case WGPEER_A_SUITE:
+		if (!mnl_attr_validate(attr, MNL_TYPE_STRING)) {
+			strncpy(peer->suite, mnl_attr_get_str(attr), sizeof(peer->suite) - 1);
+			peer->suite[sizeof(peer->suite) - 1] = '\0';
+			peer->flags |= WGPEER_HAS_SUITE;
+		}
+		break;
 	case WGPEER_A_LAST_HANDSHAKE_TIME:
 		if (mnl_attr_get_payload_len(attr) == sizeof(peer->last_handshake_time))
 			memcpy(&peer->last_handshake_time, mnl_attr_get_payload(attr), sizeof(peer->last_handshake_time));
@@ -375,6 +433,48 @@ static int parse_peer(const struct nlattr *attr, void *data)
 		return mnl_attr_parse_nested(attr, parse_allowedips, peer);
 	}
 
+	return MNL_CB_OK;
+}
+
+/* One entry of the accept set. The entry is a nest holding a name, so this
+ * parses the inner attribute rather than reading the outer one as a string.
+ */
+static int parse_suite(const struct nlattr *attr, void *data)
+{
+	struct wgsuite *suite = data;
+
+	if (mnl_attr_get_type(attr) == WGSUITE_A_NAME &&
+	    !mnl_attr_validate(attr, MNL_TYPE_STRING)) {
+		strncpy(suite->name, mnl_attr_get_str(attr), sizeof(suite->name) - 1);
+		suite->name[sizeof(suite->name) - 1] = '\0';
+	}
+	return MNL_CB_OK;
+}
+
+static int parse_suites(const struct nlattr *attr, void *data)
+{
+	struct wgdevice *device = data;
+	struct wgsuite *new_suite = calloc(1, sizeof(*new_suite));
+	int ret;
+
+	if (!new_suite) {
+		perror("calloc");
+		return MNL_CB_ERROR;
+	}
+	if (!device->first_suite)
+		device->first_suite = device->last_suite = new_suite;
+	else {
+		device->last_suite->next_suite = new_suite;
+		device->last_suite = new_suite;
+	}
+	ret = mnl_attr_parse_nested(attr, parse_suite, new_suite);
+	if (ret != MNL_CB_OK)
+		return ret;
+	/* A nameless entry would round-trip into a setconf that asks the kernel
+	 * to accept the empty string, so refuse it here rather than pass it on.
+	 */
+	if (!new_suite->name[0])
+		return MNL_CB_ERROR;
 	return MNL_CB_OK;
 }
 
@@ -439,6 +539,15 @@ static int parse_device(const struct nlattr *attr, void *data)
 		if (!mnl_attr_validate(attr, MNL_TYPE_U32))
 			device->fwmark = mnl_attr_get_u32(attr);
 		break;
+	case WGDEVICE_A_LOCAL_SUITE:
+		if (!mnl_attr_validate(attr, MNL_TYPE_STRING)) {
+			strncpy(device->local_suite, mnl_attr_get_str(attr), sizeof(device->local_suite) - 1);
+			device->local_suite[sizeof(device->local_suite) - 1] = '\0';
+			device->flags |= WGDEVICE_HAS_LOCAL_SUITE;
+		}
+		break;
+	case WGDEVICE_A_ACCEPT_SUITES:
+		return mnl_attr_parse_nested(attr, parse_suites, device);
 	case WGDEVICE_A_PEERS:
 		return mnl_attr_parse_nested(attr, parse_peers, device);
 	}

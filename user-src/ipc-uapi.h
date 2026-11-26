@@ -62,6 +62,29 @@ static int userspace_set_device(struct wgdevice *dev)
 			goto out;
 		}
 	}
+	/* The four suite keys are spelled exactly as the Go tree spells them,
+	 * because this is the path that talks to a userspace implementation:
+	 * a name that diverged here would configure a Go or Rust device wrongly
+	 * while the kernel kept working, which is the hardest kind of
+	 * difference to notice.
+	 */
+	/* Order matters to the far end: accepting a suite derives its initial
+	 * state, and a device can only initiate with, or pin a peer to, a suite
+	 * it already accepts. So the accept set goes out FIRST, then
+	 * local_suite, then the peers.
+	 */
+	for (struct wgsuite *suite = dev->first_suite; suite; suite = suite->next_suite) {
+		if (fprintf(f, "accept_suite=%s\n", suite->name) < 0) {
+			ret = errno ? -errno : -EIO;
+			goto out;
+		}
+	}
+	if (dev->flags & WGDEVICE_HAS_LOCAL_SUITE) {
+		if (fprintf(f, "local_suite=%s\n", dev->local_suite) < 0) {
+			ret = errno ? -errno : -EIO;
+			goto out;
+		}
+	}
 	if (dev->flags & WGDEVICE_REPLACE_PEERS) {
 		if (fprintf(f, "replace_peers=true\n") < 0) {
 			ret = errno ? -errno : -EIO;
@@ -118,6 +141,12 @@ static int userspace_set_device(struct wgdevice *dev)
 		}
 		if (peer->flags & WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL) {
 			if (fprintf(f, "persistent_keepalive_interval=%u\n", peer->persistent_keepalive_interval) < 0) {
+				ret = errno ? -errno : -EIO;
+				goto out;
+			}
+		}
+		if (peer->flags & WGPEER_HAS_SUITE) {
+			if (fprintf(f, "suite=%s\n", peer->suite) < 0) {
 				ret = errno ? -errno : -EIO;
 				goto out;
 			}
@@ -371,6 +400,30 @@ static int userspace_get_device(struct wgdevice **out, const char *iface)
 				break;
 			}
 			freeaddrinfo(resolved);
+		} else if (peer && !strcmp(key, "suite")) {
+			strncpy(peer->suite, value, sizeof(peer->suite) - 1);
+			peer->suite[sizeof(peer->suite) - 1] = '\0';
+			peer->flags |= WGPEER_HAS_SUITE;
+		} else if (!peer && !strcmp(key, "local_suite")) {
+			strncpy(dev->local_suite, value, sizeof(dev->local_suite) - 1);
+			dev->local_suite[sizeof(dev->local_suite) - 1] = '\0';
+			dev->flags |= WGDEVICE_HAS_LOCAL_SUITE;
+		} else if (!peer && !strcmp(key, "accept_suite")) {
+			struct wgsuite *new_suite = calloc(1, sizeof(*new_suite));
+
+			if (!new_suite) {
+				perror("calloc");
+				ret = -ENOMEM;
+				goto err;
+			}
+			strncpy(new_suite->name, value, sizeof(new_suite->name) - 1);
+			new_suite->name[sizeof(new_suite->name) - 1] = '\0';
+			if (!dev->first_suite)
+				dev->first_suite = dev->last_suite = new_suite;
+			else {
+				dev->last_suite->next_suite = new_suite;
+				dev->last_suite = new_suite;
+			}
 		} else if (peer && !strcmp(key, "persistent_keepalive_interval")) {
 			peer->persistent_keepalive_interval = NUM(0xffffU);
 			peer->flags |= WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL;
