@@ -402,23 +402,25 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
 	if (ret)
 		goto err_zero_cookie_checker_secret;
 	wg->local_suite = &wg_suite_legacy;
-	/* NOT accepting wg_suite_sha384 yet, deliberately. Everything needed to
-	 * serve it is in place and selftested, including its precomputed
-	 * transcript, its 278/189 framing and per-suite cookie keys, but a
-	 * SHA-384 response from this kernel is still rejected by the Go and
-	 * Rust initiators for a transcript reason not yet isolated. Registering
-	 * it would advertise a suite that does not interoperate, which is worse
-	 * than not offering it. Adding this one line is all that turns it on
-	 * once that is fixed.
+	/* Both suites are served. Mark, 2026-11-26: "it is entirely ok for a
+	 * connection to fail because one side or the other lacks an algo."
 	 *
-	 * What is actually in the way is 6ytx.52, not the transcript: wg-fips
-	 * has no suite keys at all, so the netlink surface 6ytx.28 built has no
-	 * client and a kernel device cannot be told which suite to initiate
-	 * with. Accepting SHA-384 here without that would be worse than
-	 * useless, because the device would still initiate legacy, the far end
-	 * accepts legacy too, and the resulting handshake would complete in
-	 * legacy while a matrix row reported the SHA-384 pair as passing.
+	 * I had kept SHA-384 out of this set on the grounds that advertising a
+	 * suite which might not interoperate was worse than not offering it.
+	 * That is the wrong trade. A handshake that fails because the far end
+	 * does not implement the suite is an ordinary outcome of a heterogeneous
+	 * fleet, not a defect to be designed around, and a device that hides a
+	 * suite it can serve is simply less useful than one that offers it and
+	 * lets the mismatch resolve itself.
+	 *
+	 * The local suite stays legacy, so this device ANSWERS SHA-384 and still
+	 * INITIATES legacy until an operator says otherwise with local-suite.
+	 * That is the migration order the design calls for: accept first, move
+	 * peers one at a time, then switch what you initiate with.
 	 */
+	ret = wg_suite_index_add(&wg->suites, &wg_suite_sha384);
+	if (ret)
+		goto err_zero_cookie_checker_secret;
 
 	ret = wg_cookie_checker_init(&wg->cookie_checker, wg);
 	if (ret)
